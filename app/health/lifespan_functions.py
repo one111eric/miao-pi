@@ -15,7 +15,6 @@ def lifespan_function(
 ) -> Callable[[FastAPI], AbstractAsyncContextManager[None]]:
     """Create a FastAPI lifespan context with optional startup and shutdown hooks."""
 
-    @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.info("Entering lifespan startup")
         if on_startup:
