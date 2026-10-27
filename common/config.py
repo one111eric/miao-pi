@@ -19,7 +19,7 @@ class SvcSettings(BaseSettings):
 
     log_level: str = "INFO"
     log_format: LogFormat = LogFormat.JSON
-    llm_provider: LLMProvider = LLMProvider.OPENAI
+    llm_provider: LLMProvider = LLMProvider.LOCAL
     llm_model: str = "gpt-4o-mini"
     llm_api_key: SecretStr | None = None
     llm_base_url: str | None = None
