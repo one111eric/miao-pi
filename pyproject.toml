@@ -31,6 +31,7 @@ py_version = 313
 [tool.mypy]
 python_version = "3.13"
 strict = true
+explicit_package_bases = true
 files = ["app", "common", "tests"]
 
 [tool.pytest.ini_options]

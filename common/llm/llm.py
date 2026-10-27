@@ -1,10 +1,14 @@
 """LangChain chat model configured for OpenAI-compatible APIs."""
 
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from langchain_openai import ChatOpenAI
+from pydantic import SecretStr
 
 from common.config import LLMProvider, SvcSettings
+
+type APIKey = SecretStr | Callable[[], str] | Callable[[], Awaitable[str]]
 
 
 class LLM(ChatOpenAI):
@@ -18,7 +22,7 @@ class LLM(ChatOpenAI):
         self,
         model: str | None = None,
         *,
-        api_key: str | None = None,
+        api_key: str | APIKey | None = None,
         base_url: str | None = None,
         settings: SvcSettings | None = None,
         **kwargs: Any,
@@ -43,7 +47,9 @@ class LLM(ChatOpenAI):
         # OpenAI discovers OPENAI_API_KEY when this remains None. Most local
         # compatible servers ignore the key, while the OpenAI client requires one.
         if base_url is not None and api_key is None:
-            api_key = "local-llm"
+            api_key = SecretStr("local-llm")
+        elif isinstance(api_key, str):
+            api_key = SecretStr(api_key)
 
         super().__init__(
             model=model,

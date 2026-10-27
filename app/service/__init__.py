@@ -2,8 +2,8 @@ import logging
 
 from fastapi import FastAPI
 
-from app.health.lifespan_functions import lifespan_function
 from app.health.router import router as health_router
+from app.service.lifespan import lifespan_function
 
 logger = logging.getLogger(__name__)
 

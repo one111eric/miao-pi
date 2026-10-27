@@ -1,6 +1,11 @@
+import json
 import logging
 
-from common.logging_helper import RequestFormatter, logging_context
+from common.logging_helper import (
+    JsonRequestFormatter,
+    RequestFormatter,
+    logging_context,
+)
 
 
 def test_nested_logging_context_overrides_existing_key() -> None:
@@ -14,3 +19,14 @@ def test_nested_logging_context_overrides_existing_key() -> None:
     assert "request_id=inner" in rendered
     assert "request_id=outer" not in rendered
     assert "details=['value']" in rendered
+
+
+def test_json_timestamp_is_explicitly_utc() -> None:
+    formatter = JsonRequestFormatter()
+    record = logging.LogRecord("test", logging.INFO, "", 0, "message", (), None)
+
+    payload = json.loads(formatter.format(record))
+    timestamp = payload["timestamp"]
+
+    assert isinstance(timestamp, str)
+    assert timestamp.endswith("Z")

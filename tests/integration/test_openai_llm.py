@@ -18,7 +18,6 @@ def test_configured_llm_can_call_openai(openai_settings: SvcSettings) -> None:
     response = LLM(settings=openai_settings, temperature=0, max_tokens=5).invoke(
         "Reply with the single word: ok"
     )
-    print(response)
 
     assert isinstance(response, AIMessage)
     assert response.content

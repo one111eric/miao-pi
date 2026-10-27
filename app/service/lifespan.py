@@ -1,20 +1,23 @@
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from contextlib import asynccontextmanager
+from typing import cast
 
 from fastapi import FastAPI
+from starlette.types import StatelessLifespan
 
 logger = logging.getLogger(__name__)
 
-LifespanCallback = Callable[[FastAPI], Awaitable[None]]
+type LifespanCallback = Callable[[FastAPI], Awaitable[None]]
 
 
 def lifespan_function(
     on_startup: LifespanCallback | None = None,
     on_shutdown: LifespanCallback | None = None,
-) -> Callable[[FastAPI], AbstractAsyncContextManager[None]]:
+) -> StatelessLifespan[FastAPI]:
     """Create a FastAPI lifespan context with optional startup and shutdown hooks."""
 
+    @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.info("Entering lifespan startup")
         if on_startup:
@@ -29,4 +32,6 @@ def lifespan_function(
                 await on_shutdown(app)
             logger.info("Lifespan shutdown complete")
 
-    return lifespan
+    # The contextlib return type is compatible with Starlette's lifespan protocol,
+    # but current type stubs do not preserve that relationship through the decorator.
+    return cast(StatelessLifespan[FastAPI], lifespan)
