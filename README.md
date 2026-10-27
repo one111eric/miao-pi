@@ -22,6 +22,14 @@ uv run uvicorn app.service.server:app --reload --port 9091
 The health endpoint is available at <http://127.0.0.1:9091/health>, and the
 OpenAPI documentation is at <http://127.0.0.1:9091/api/v1/docs>.
 
+Invoke the agent:
+
+```bash
+curl -X POST http://127.0.0.1:9091/invoke \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"Explain recursion in one sentence."}'
+```
+
 ## LLM client
 
 `LLM` is a `langchain_openai.ChatOpenAI` subclass, so it can be passed directly

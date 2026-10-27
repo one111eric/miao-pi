@@ -2,6 +2,7 @@ import logging
 
 from fastapi import FastAPI
 
+from app.agent import router as agent_router
 from app.health.router import router as health_router
 from app.service.lifespan import lifespan_function
 
@@ -36,6 +37,7 @@ def create_app() -> FastAPI:
         },
     )
 
+    app.include_router(agent_router)
     app.include_router(health_router)
 
     return app

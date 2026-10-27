@@ -1,7 +1,6 @@
 import pytest
 from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
-from pydantic_settings import SettingsConfigDict
 
 from common.config import LLMProvider, SvcSettings
 from common.llm import LLM
@@ -15,8 +14,21 @@ LLM_ENVIRONMENT_VARIABLES = (
 )
 
 
-class UnitTestSettings(SvcSettings):
-    model_config = SettingsConfigDict(env_file=None)
+def unit_settings(
+    *,
+    provider: LLMProvider = LLMProvider.OPENAI,
+    model: str = "test-model",
+    api_key: SecretStr | None = None,
+    base_url: str | None = None,
+) -> SvcSettings:
+    """Build settings whose LLM values cannot be overridden by the environment."""
+    return SvcSettings(
+        llm_provider=provider,
+        llm_model=model,
+        llm_api_key=api_key,
+        llm_base_url=base_url,
+        openai_api_key=None,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -30,8 +42,8 @@ def test_llm_is_a_langchain_chat_model() -> None:
     llm = LLM(
         "local-model",
         base_url="http://localhost:11434/v1",
-        settings=UnitTestSettings(
-            llm_api_key=SecretStr("local-test-key"),
+        settings=unit_settings(
+            api_key=SecretStr("local-test-key"),
         ),
     )
 
@@ -46,7 +58,7 @@ def test_llm_forwards_langchain_options() -> None:
     llm = LLM(
         "gpt-test",
         api_key="test-key",
-        settings=UnitTestSettings(),
+        settings=unit_settings(),
         temperature=0.2,
         max_tokens=25,
     )
@@ -58,10 +70,10 @@ def test_llm_forwards_langchain_options() -> None:
 
 
 def test_llm_uses_the_selected_provider_settings() -> None:
-    settings = UnitTestSettings(
-        llm_provider=LLMProvider.LOCAL,
-        llm_model="qwen2.5",
-        llm_base_url="http://localhost:11434/v1",
+    settings = unit_settings(
+        provider=LLMProvider.LOCAL,
+        model="qwen2.5",
+        base_url="http://localhost:11434/v1",
     )
 
     llm = LLM(settings=settings)
@@ -72,11 +84,11 @@ def test_llm_uses_the_selected_provider_settings() -> None:
 
 def test_rejects_an_empty_model() -> None:
     with pytest.raises(ValueError, match="model"):
-        LLM("", settings=UnitTestSettings())
+        LLM("", settings=unit_settings())
 
 
 def test_local_provider_requires_a_base_url() -> None:
-    settings = UnitTestSettings(llm_provider=LLMProvider.LOCAL)
+    settings = unit_settings(provider=LLMProvider.LOCAL)
 
     with pytest.raises(ValueError, match="llm_base_url"):
         LLM(settings=settings)
