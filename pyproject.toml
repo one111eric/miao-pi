@@ -4,6 +4,9 @@ version = "0.1.0"
 requires-python = ">=3.13.7"
 dependencies = [
     "fastapi>=0.149.0",
+    "langchain>=1.4.7",
+    "langchain-openai>=1.0.0",
+    "langgraph>=1.2.17",
     "pydantic>=2.14.1",
     "pydantic-settings>=2.16.0",
     "python-json-logger>=4.2.0",
@@ -29,8 +32,13 @@ py_version = 313
 [tool.mypy]
 python_version = "3.13"
 strict = true
+explicit_package_bases = true
 files = ["app", "common", "tests"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+markers = [
+    "openai_live: makes a live, paid request to the configured OpenAI API",
+    "local_llm_live: makes a live request to the configured local LLM server",
+]

@@ -1,1 +1,1 @@
-"""Health-check and application-lifespan support."""
+"""Health-check API support."""

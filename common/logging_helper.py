@@ -1,4 +1,5 @@
 import logging
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
@@ -22,6 +23,10 @@ LOGGING_DATEFMT = "%Y-%m-%dT%H:%M:%S"
 _DEFAULT_RECORD_ATTRS = frozenset(
     logging.LogRecord("", 0, "", 0, "", (), None).__dict__
 )
+
+
+def _utc_converter(timestamp: float | None) -> time.struct_time:
+    return time.gmtime(timestamp)
 
 
 def reset_context(state: Token[dict[str, object]]) -> None:
@@ -53,6 +58,8 @@ def _get_context() -> dict[str, object]:
 class RequestFormatter(logging.Formatter):
     """Text-based structured formatter (key=value output)."""
 
+    converter = staticmethod(_utc_converter)
+
     def format(self, record: logging.LogRecord) -> str:
         contexts: list[str] = []
 
@@ -77,6 +84,8 @@ class RequestFormatter(logging.Formatter):
 class JsonRequestFormatter(JsonFormatter):
     """JSON-lines formatter that merges extra fields and request context."""
 
+    converter = staticmethod(_utc_converter)
+
     def __init__(self) -> None:
         super().__init__(
             "%(asctime)s %(msecs)03d %(levelname)s %(name)s %(message)s %(context)s",
@@ -92,7 +101,7 @@ class JsonRequestFormatter(JsonFormatter):
     ) -> None:
         super().add_fields(log_data, record, message_dict)
         msecs = str(int(log_data.get("msecs", 0))).zfill(3)
-        log_data["timestamp"] = f"{log_data.get('asctime', '')}.{msecs}"
+        log_data["timestamp"] = f"{log_data.get('asctime', '')}.{msecs}Z"
         log_data.pop("asctime", None)
         log_data.pop("msecs", None)
 

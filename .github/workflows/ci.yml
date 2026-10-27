@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Install Python and dependencies
+        run: |
+          uv python install 3.13.7
+          uv sync --locked --dev
+      - name: Check formatting
+        run: |
+          uv run black --check .
+          uv run isort --check-only .
+      - name: Check types
+        run: uv run mypy
+      - name: Run tests
+        run: uv run pytest
