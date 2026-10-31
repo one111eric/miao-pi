@@ -51,6 +51,10 @@ class LLM(ChatOpenAI):
         elif isinstance(api_key, str):
             api_key = SecretStr(api_key)
 
+        # Explicit arguments take precedence over the configured defaults.
+        kwargs.setdefault("timeout", settings.llm_timeout)
+        kwargs.setdefault("max_retries", settings.llm_max_retries)
+
         super().__init__(
             model=model,
             api_key=api_key,

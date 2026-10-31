@@ -19,10 +19,13 @@ class SvcSettings(BaseSettings):
 
     log_level: str = "INFO"
     log_format: LogFormat = LogFormat.JSON
-    llm_provider: LLMProvider = LLMProvider.LOCAL
+    llm_provider: LLMProvider = LLMProvider.OPENAI
     llm_model: str = "gpt-4o-mini"
     llm_api_key: SecretStr | None = None
     llm_base_url: str | None = None
+    llm_timeout: float = Field(default=60, gt=0)
+    llm_max_retries: int = Field(default=3, ge=0)
+
     openai_api_key: SecretStr | None = Field(
         default=None,
         validation_alias="OPENAI_API_KEY",
