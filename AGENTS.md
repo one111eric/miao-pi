@@ -31,6 +31,8 @@ Fix formatting with `uv run isort . && uv run black .`.
 - `app/service/` — `create_app()`, lifespan hooks, and the uvicorn entry
   point (`server.py`). Startup builds the LLM once and compiles the agent
   graph into `app.state`; `create_app(llm=...)` overrides the model.
+  `middlewares/` holds the request-id middleware, and `error_handling/` maps
+  provider errors to HTTP statuses.
 - `app/<feature>/` — one package per API feature (`agent`, `health`), each
   with `router.py` and `models.py` (Pydantic request/response models).
 - `app/agent/` — the LangGraph workflow: `state.py` (graph state),
@@ -51,6 +53,18 @@ compiled graph `preplanning → react → finalize`.
 - `react` calls the LLM, which `build_agent_graph(llm)` injects through
   `make_react(llm)`. There are no tools or loop yet.
 - `finalize` is a placeholder for post-processing.
+
+Around every request:
+
+- `RequestContextMiddleware` takes a valid `X-Request-ID` (or generates
+  one), adds it to the logging context, and returns it in the response
+  header. Unhandled errors are logged there and returned as a generic `500`
+  that still carries the header.
+- OpenAI provider errors map to `504` (timeout) or `502` (anything else),
+  with a generic message. Never put provider error text in a response.
+- Model calls use `llm_timeout` and `llm_max_retries` from `SvcSettings`;
+  arguments passed to `LLM(...)` override them. `react` logs each call's
+  duration and token usage.
 
 The graph is still a skeleton and will change. Update this section when you
 change its shape.

@@ -17,6 +17,7 @@ dependencies = [
 dev = [
     "black>=26.10.1",
     "httpx>=0.28.1",
+    "httpx2>=2.16.0",
     "isort>=9.0.2",
     "mypy>=2.4.0",
     "pytest>=9.1.1",

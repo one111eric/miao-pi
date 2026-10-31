@@ -14,8 +14,9 @@ langchain-openai 1.7.2, and fastapi 0.149.0.
 - Graph: `preplanning → react → finalize`, run once per request. No tools,
   no loop, no memory.
 - `thread_id` is accepted and echoed back but not persisted.
-- `LLM` sets no timeout or retry policy, so it uses the OpenAI client
-  defaults (a 10-minute timeout with 2 retries).
+- Requests carry an `X-Request-ID` through the logs, provider errors map to
+  `502`/`504`, and model calls use the `llm_timeout`/`llm_max_retries`
+  settings (step 1).
 - Tests inject `EchoChatModel` (`tests/conftest.py`), so default runs never
   call a real model.
 
@@ -72,6 +73,8 @@ the server, LLM client, graph skeleton, the small fixes, `AGENTS.md`,
 ---
 
 ## 1. Request IDs, error mapping, model timeout
+
+**Status: done (2026-10-31).**
 
 **Goal:** every request is traceable in the logs, model calls can't hang,
 and provider failures return meaningful status codes.
@@ -267,6 +270,10 @@ Shared rules:
     `agent_max_steps`, default about 25).
   - Catch `GraphRecursionError` (`from langgraph.errors import
     GraphRecursionError`) and return a clear error instead of a bare 500.
+  - Add an overall deadline for the whole run (for example
+    `agent_run_timeout` with `asyncio.timeout`). Each model call can take
+    `llm_timeout × (llm_max_retries + 1)`, about 4 minutes with the defaults,
+    and the loop multiplies that by the number of steps.
 
 **Tests**
 
