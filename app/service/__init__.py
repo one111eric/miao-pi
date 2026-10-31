@@ -3,6 +3,7 @@ import logging
 from fastapi import FastAPI
 
 from app.agent import router as agent_router
+from app.agent.graph import build_agent_graph
 from app.health.router import router as health_router
 from app.service.lifespan import lifespan_function
 
@@ -12,13 +13,15 @@ service_name = "miao-pi-agent-svc"
 description = "Web server for the miao-pi agent"
 
 
-async def on_startup(_: FastAPI) -> None:
+async def on_startup(app: FastAPI) -> None:
     logger.info("Starting up...")
+    app.state.agent_graph = build_agent_graph()
     logger.info("Startup complete")
 
 
-async def on_shutdown(_: FastAPI) -> None:
+async def on_shutdown(app: FastAPI) -> None:
     logger.info("Shutting down...")
+    del app.state.agent_graph
     logger.info("Shutdown complete")
 
 
