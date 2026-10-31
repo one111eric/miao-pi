@@ -1,9 +1,17 @@
+from collections.abc import Awaitable
+from typing import Protocol
+
+from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import SystemMessage
 
 from app.agent.state import AgentState
-from common.llm import LLM
 
 SYSTEM_PROMPT = "You are Miao Pi, a concise and helpful coding assistant."
+
+
+class AgentNode(Protocol):
+    # LangGraph matches nodes by the parameter name, so a Callable alias won't do.
+    def __call__(self, state: AgentState) -> Awaitable[AgentState]: ...
 
 
 async def preplanning(state: AgentState) -> AgentState:
@@ -20,10 +28,14 @@ async def preplanning(state: AgentState) -> AgentState:
     }
 
 
-async def react(state: AgentState) -> AgentState:
-    """Invoke the configured chat model."""
-    response = await LLM().ainvoke(state["messages"])
-    return {**state, "messages": [*state["messages"], response]}
+def make_react(llm: BaseChatModel) -> AgentNode:
+    """Create the node that invokes the given chat model."""
+
+    async def react(state: AgentState) -> AgentState:
+        response = await llm.ainvoke(state["messages"])
+        return {**state, "messages": [*state["messages"], response]}
+
+    return react
 
 
 async def finalize(state: AgentState) -> AgentState:

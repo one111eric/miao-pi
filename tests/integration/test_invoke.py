@@ -1,22 +1,9 @@
 import pytest
 from httpx import AsyncClient
-from langchain_core.messages import AIMessage, BaseMessage
-
-from app.agent import nodes
-
-
-class FakeLLM:
-    async def ainvoke(self, messages: list[BaseMessage]) -> AIMessage:
-        return AIMessage(content=f"Received: {messages[-1].text}")
 
 
 @pytest.mark.anyio
-async def test_invoke_agent(
-    client: AsyncClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(nodes, "LLM", FakeLLM)
-
+async def test_invoke_agent(client: AsyncClient) -> None:
     response = await client.post(
         "/invoke",
         json={"message": "Hello", "thread_id": "thread-1"},
