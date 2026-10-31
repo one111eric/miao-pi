@@ -55,5 +55,7 @@ class LLM(ChatOpenAI):
             model=model,
             api_key=api_key,
             base_url=base_url,
+            timeout=settings.llm_timeout,
+            max_retries=settings.llm_max_retries,
             **kwargs,
         )

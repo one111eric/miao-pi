@@ -23,6 +23,9 @@ class SvcSettings(BaseSettings):
     llm_model: str = "gpt-4o-mini"
     llm_api_key: SecretStr | None = None
     llm_base_url: str | None = None
+    llm_timeout: int = 60
+    llm_max_retries: int = 3
+
     openai_api_key: SecretStr | None = Field(
         default=None,
         validation_alias="OPENAI_API_KEY",
