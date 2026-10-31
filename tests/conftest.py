@@ -26,7 +26,14 @@ class EchoChatModel(BaseChatModel):
         run_manager: CallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> ChatResult:
-        message = AIMessage(content=f"Received: {messages[-1].text}")
+        message = AIMessage(
+            content=f"Received: {messages[-1].text}",
+            usage_metadata={
+                "input_tokens": 2,
+                "output_tokens": 3,
+                "total_tokens": 5,
+            },
+        )
         return ChatResult(generations=[ChatGeneration(message=message)])
 
 

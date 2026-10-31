@@ -1,10 +1,14 @@
+import logging
 from collections.abc import Awaitable
+from time import perf_counter
 from typing import Protocol
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import AIMessage, SystemMessage
 
 from app.agent.state import AgentState
+
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = "You are Miao Pi, a concise and helpful coding assistant."
 
@@ -32,7 +36,16 @@ def make_react(llm: BaseChatModel) -> AgentNode:
     """Create the node that invokes the given chat model."""
 
     async def react(state: AgentState) -> AgentState:
+        started_at = perf_counter()
         response = await llm.ainvoke(state["messages"])
+
+        log_fields: dict[str, object] = {
+            "model_duration_ms": round((perf_counter() - started_at) * 1000, 2),
+        }
+        if isinstance(response, AIMessage) and response.usage_metadata is not None:
+            log_fields.update(response.usage_metadata)
+        logger.info("LLM call completed", extra=log_fields)
+
         return {**state, "messages": [*state["messages"], response]}
 
     return react

@@ -6,7 +6,9 @@ from langchain_core.language_models import BaseChatModel
 from app.agent import router as agent_router
 from app.agent.graph import build_agent_graph
 from app.health.router import router as health_router
+from app.service.error_handling import register_exception_handlers
 from app.service.lifespan import LifespanCallback, lifespan_function
+from app.service.middlewares import RequestContextMiddleware
 from common.llm import LLM
 
 logger = logging.getLogger(__name__)
@@ -48,6 +50,8 @@ def create_app(llm: BaseChatModel | None = None) -> FastAPI:
         },
     )
 
+    app.add_middleware(RequestContextMiddleware)
+    register_exception_handlers(app)
     app.include_router(agent_router)
     app.include_router(health_router)
 
