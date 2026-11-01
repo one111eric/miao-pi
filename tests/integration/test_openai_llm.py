@@ -32,7 +32,6 @@ def test_configured_llm_can_call_local_model(local_llm_settings: SvcSettings) ->
     response = LLM(settings=local_llm_settings, temperature=0).invoke(
         "Reply with the single word: ok"
     )
-    print(response)
 
     assert isinstance(response, AIMessage)
     assert response.content

@@ -1,6 +1,6 @@
 import pytest
 from langchain_openai import ChatOpenAI
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 
 from common.config import LLMProvider, SvcSettings
 from common.llm import LLM
@@ -10,6 +10,8 @@ LLM_ENVIRONMENT_VARIABLES = (
     "LLM_MODEL",
     "LLM_API_KEY",
     "LLM_BASE_URL",
+    "LLM_TIMEOUT",
+    "LLM_MAX_RETRIES",
     "OPENAI_API_KEY",
 )
 
@@ -80,6 +82,47 @@ def test_llm_uses_the_selected_provider_settings() -> None:
 
     assert llm.model_name == "qwen2.5"
     assert llm.openai_api_base == "http://localhost:11434/v1"
+
+
+def test_llm_uses_the_configured_timeout_and_retries() -> None:
+    settings = SvcSettings(
+        llm_provider=LLMProvider.OPENAI,
+        llm_timeout=12.5,
+        llm_max_retries=1,
+    )
+
+    llm = LLM("gpt-test", api_key="test-key", settings=settings)
+
+    assert llm.request_timeout == 12.5
+    assert llm.max_retries == 1
+
+
+def test_explicit_timeout_and_retries_override_settings() -> None:
+    settings = SvcSettings(
+        llm_provider=LLMProvider.OPENAI,
+        llm_timeout=12.5,
+        llm_max_retries=1,
+    )
+
+    llm = LLM(
+        "gpt-test",
+        api_key="test-key",
+        settings=settings,
+        timeout=5,
+        max_retries=0,
+    )
+
+    assert llm.request_timeout == 5
+    assert llm.max_retries == 0
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"llm_timeout": 0}, {"llm_max_retries": -1}],
+)
+def test_rejects_invalid_timeout_settings(overrides: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        SvcSettings.model_validate(overrides)
 
 
 def test_rejects_an_empty_model() -> None:
