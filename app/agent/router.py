@@ -1,3 +1,4 @@
+import logging
 from typing import Annotated, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -6,6 +7,8 @@ from app.agent.graph import AgentGraph
 from app.agent.models import AgentRequest, AgentResponse
 from app.agent.service import invoke_agent
 from app.agent.threads import ThreadBusyError, ThreadStore
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["agent"])
 
@@ -53,6 +56,10 @@ async def invoke(
     try:
         return await invoke_agent(request, graph, threads)
     except ThreadBusyError as error:
+        logger.info(
+            "Agent invocation rejected",
+            extra={"thread_id": error.thread_id, "reason": "thread_busy"},
+        )
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Thread already has a run in progress",
