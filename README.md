@@ -30,6 +30,21 @@ curl -X POST http://127.0.0.1:9091/invoke \
   -d '{"message":"Explain recursion in one sentence."}'
 ```
 
+The response includes a `thread_id`. Send it back to continue the same
+conversation:
+
+```bash
+curl -X POST http://127.0.0.1:9091/invoke \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"Now give an example.","thread_id":"<thread_id from the first response>"}'
+```
+
+A thread handles one request at a time: sending another message to a thread
+whose previous request is still running returns `409 Conflict`.
+
+Conversations are kept in memory only: they're lost on restart, and threads
+unused for `THREAD_TTL` seconds (or beyond `MAX_THREADS`) are deleted.
+
 ## LLM client
 
 `LLM` is a `langchain_openai.ChatOpenAI` subclass, so it can be passed directly

@@ -5,10 +5,12 @@ from langchain_core.language_models import BaseChatModel
 
 from app.agent import router as agent_router
 from app.agent.graph import build_agent_graph
+from app.agent.threads import ThreadStore
 from app.health.router import router as health_router
 from app.service.error_handling import register_exception_handlers
 from app.service.lifespan import LifespanCallback, lifespan_function
 from app.service.middlewares import RequestContextMiddleware
+from common.config import SvcSettings
 from common.llm import LLM
 
 logger = logging.getLogger(__name__)
@@ -17,13 +19,25 @@ service_name = "miao-pi-agent-svc"
 description = "Web server for the miao-pi agent"
 
 
-def make_on_startup(llm: BaseChatModel | None = None) -> LifespanCallback:
-    """Create the startup hook; the configured ``LLM`` is used unless one is given."""
+def make_on_startup(
+    llm: BaseChatModel | None = None,
+    thread_store: ThreadStore | None = None,
+) -> LifespanCallback:
+    """Create the startup hook; configured defaults are used unless given."""
 
     async def on_startup(app: FastAPI) -> None:
         logger.info("Starting up...")
+        settings = SvcSettings()
+        threads = thread_store or ThreadStore(
+            ttl=settings.thread_ttl,
+            max_threads=settings.max_threads,
+        )
+        app.state.thread_store = threads
         # Built once here so a misconfigured provider fails at startup.
-        app.state.agent_graph = build_agent_graph(llm or LLM())
+        app.state.agent_graph = build_agent_graph(
+            llm or LLM(settings=settings),
+            checkpointer=threads.checkpointer,
+        )
         logger.info("Startup complete")
 
     return on_startup
@@ -32,14 +46,18 @@ def make_on_startup(llm: BaseChatModel | None = None) -> LifespanCallback:
 async def on_shutdown(app: FastAPI) -> None:
     logger.info("Shutting down...")
     del app.state.agent_graph
+    del app.state.thread_store
     logger.info("Shutdown complete")
 
 
-def create_app(llm: BaseChatModel | None = None) -> FastAPI:
+def create_app(
+    llm: BaseChatModel | None = None,
+    thread_store: ThreadStore | None = None,
+) -> FastAPI:
     app = FastAPI(
         title=service_name,
         description=description,
-        lifespan=lifespan_function(make_on_startup(llm), on_shutdown),
+        lifespan=lifespan_function(make_on_startup(llm, thread_store), on_shutdown),
         openapi_url="/api/v1/openapi.json",
         docs_url="/api/v1/docs",
         redoc_url="/api/v1/redoc",
