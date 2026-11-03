@@ -3,8 +3,9 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
-from app.agent.nodes import finalize, make_react, preplanning
+from app.agent.nodes import finalize, make_preplanning, make_react
 from app.agent.state import AgentState
+from app.agent.workspace import Workspace
 
 type AgentGraph = CompiledStateGraph[
     AgentState,
@@ -17,6 +18,8 @@ type AgentGraph = CompiledStateGraph[
 def build_agent_graph(
     llm: BaseChatModel,
     checkpointer: BaseCheckpointSaver[str] | None = None,
+    workspace: Workspace | None = None,
+    context_max_chars: int = 20_000,
 ) -> AgentGraph:
     """Build and compile the agent workflow around the given chat model.
 
@@ -24,7 +27,10 @@ def build_agent_graph(
     continue the same conversation.
     """
     graph_builder = StateGraph(AgentState)
-    graph_builder.add_node("preplanning", preplanning)
+    graph_builder.add_node(
+        "preplanning",
+        make_preplanning(workspace, context_max_chars),
+    )
     graph_builder.add_node("react", make_react(llm))
     graph_builder.add_node("finalize", finalize)
 

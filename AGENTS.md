@@ -37,7 +37,8 @@ Fix formatting with `uv run isort . && uv run black .`.
   with `router.py` and `models.py` (Pydantic request/response models).
 - `app/agent/` — the LangGraph workflow: `state.py` (graph state),
   `nodes.py` (async node functions), `graph.py` (wiring and compile),
-  `service.py` (runs the graph for a request).
+  `service.py` (runs the graph for a request), and `workspace.py` (the
+  boundary for project files).
 - `common/` — code shared across features: `config.py` (`SvcSettings`),
   `llm/` (`LLM`, a `ChatOpenAI` subclass), `logging_helper.py`.
 - `tests/unit/` — no network, no app lifespan.
@@ -49,11 +50,12 @@ Fix formatting with `uv run isort . && uv run black .`.
 Request flow: `POST /invoke` → `app/agent/router.py` → `invoke_agent()` →
 compiled graph `preplanning → react → finalize`.
 
-- `preplanning` is a no-op placeholder (step 3 adds workspace context).
+- `preplanning` reloads `AGENTS.md` (falling back to `README.md`) from the
+  workspace on every turn, with a configured size cap.
 - `react` calls the LLM, which `build_agent_graph(llm)` injects through
-  `make_react(llm)`. It adds `SYSTEM_PROMPT` in front of the messages at call
-  time; the prompt is never stored in the state. There are no tools or loop
-  yet.
+  `make_react(llm)`. It builds a system message from `SYSTEM_PROMPT` and the
+  current workspace context at call time; neither is stored in message
+  history. There are no tools or loop yet.
 - `finalize` is a placeholder for post-processing.
 
 State and memory:
@@ -80,6 +82,24 @@ State and memory:
     await, never working from a copy. Deletes can await I/O.
   - A failed delete is logged, and the thread stays tracked for a retry. It
     never fails the run that triggered the cleanup.
+
+Workspace boundary:
+
+- `Workspace.resolve()` is the only path boundary for agent code. It rejects
+  paths and symlinks outside `workspace_root`, and denied paths both before
+  and after following symlinks.
+  - `.env*` and `.git` are always denied (`REQUIRED_DENIED_PATTERNS`);
+    `workspace_denied_paths` adds to them.
+  - Patterns are globs matched case-insensitively and Unicode-normalized.
+    One without `/` matches a name at any depth; one with `/` is rooted at
+    the workspace and covers everything beneath it.
+- The workspace is validated and built at startup, then injected into the
+  graph. Future tools must receive this instance instead of constructing
+  paths directly.
+- Project context is capped by `workspace_context_max_chars` and reloaded
+  every turn so instruction changes take effect without restarting. An
+  inaccessible `AGENTS.md` is skipped in favor of `README.md`; if neither can
+  be read, the base prompt is used.
 
 Around every request:
 
@@ -137,6 +157,12 @@ change its shape.
   isn't shared between workers, so run a single worker until step 8.
 - Any caller can continue any `thread_id` they know. There's no ownership
   check until authentication lands (step 5a).
+- The configured workspace root must exist and be a directory. Context files
+  are optional; without either `AGENTS.md` or `README.md`, the base system
+  prompt is used.
+- `workspace_root` defaults to the process working directory. Set it
+  explicitly in deployment before file-writing tools are enabled, or the
+  service may be able to edit its own checkout.
 
 ## Rules
 

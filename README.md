@@ -45,6 +45,30 @@ whose previous request is still running returns `409 Conflict`.
 Conversations are kept in memory only: they're lost on restart, and threads
 unused for `THREAD_TTL` seconds (or beyond `MAX_THREADS`) are deleted.
 
+## Workspace context
+
+The agent is restricted to one workspace and reads `AGENTS.md`, falling back
+to `README.md`, before each model call:
+
+```env
+WORKSPACE_ROOT=/path/to/project
+WORKSPACE_DENIED_PATHS=["*.pem", "config/private"]
+WORKSPACE_CONTEXT_MAX_CHARS=20000
+```
+
+Paths outside the workspace and symlink escapes are rejected. The patterns
+`.env*` and `.git` are always denied at any depth; `WORKSPACE_DENIED_PATHS`
+adds to them. Patterns are case-insensitive globs. One without a `/`, such as
+`*.pem`, matches a name at any depth. One with a `/`, such as
+`config/private`, is relative to the workspace root and also denies
+everything beneath it. `.env*` intentionally includes `.env.example`, so
+environment templates must be documented separately before file-reading tools
+are added.
+
+`WORKSPACE_ROOT` defaults to the server's current directory. Set it explicitly
+in deployment so future file tools cannot modify the service itself by
+accident.
+
 ## LLM client
 
 `LLM` is a `langchain_openai.ChatOpenAI` subclass, so it can be passed directly

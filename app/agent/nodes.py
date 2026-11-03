@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from collections.abc import Awaitable
 from time import perf_counter
@@ -7,6 +8,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, SystemMessage
 
 from app.agent.state import AgentState, AgentUpdate
+from app.agent.workspace import Workspace, WorkspaceError
 
 logger = logging.getLogger(__name__)
 
@@ -18,12 +20,41 @@ class AgentNode(Protocol):
     def __call__(self, state: AgentState) -> Awaitable[AgentUpdate]: ...
 
 
-async def preplanning(state: AgentState) -> AgentUpdate:
-    """
-    Prepare the run before model invocation.
-    Will add contextize capabilities to this node too.
-    """
-    return {}
+def _load_project_context(workspace: Workspace, max_chars: int) -> str:
+    for filename in ("AGENTS.md", "README.md"):
+        try:
+            path = workspace.resolve(filename)
+            if path.is_file():
+                return workspace.read_text(filename, max_chars=max_chars)
+        except (WorkspaceError, OSError) as exc:
+            logger.warning(
+                "Skipping inaccessible project context",
+                extra={
+                    "context_file": filename,
+                    "error_type": type(exc).__name__,
+                },
+            )
+    return ""
+
+
+def make_preplanning(
+    workspace: Workspace | None,
+    context_max_chars: int,
+) -> AgentNode:
+    """Create a node that reloads project instructions for every turn."""
+
+    async def preplanning(state: AgentState) -> AgentUpdate:
+        del state
+        if workspace is None:
+            return {"context": ""}
+        context = await asyncio.to_thread(
+            _load_project_context,
+            workspace,
+            context_max_chars,
+        )
+        return {"context": context}
+
+    return preplanning
 
 
 def make_react(llm: BaseChatModel) -> AgentNode:
@@ -32,8 +63,11 @@ def make_react(llm: BaseChatModel) -> AgentNode:
     async def react(state: AgentState) -> AgentUpdate:
         started_at = perf_counter()
         # Added per call rather than stored, so threads never save the prompt.
+        system_prompt = SYSTEM_PROMPT
+        if context := state.get("context"):
+            system_prompt = f"{SYSTEM_PROMPT}\n\nProject context:\n{context}"
         response = await llm.ainvoke(
-            [SystemMessage(content=SYSTEM_PROMPT), *state["messages"]]
+            [SystemMessage(content=system_prompt), *state["messages"]]
         )
 
         log_fields: dict[str, object] = {

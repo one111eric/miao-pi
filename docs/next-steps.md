@@ -1,7 +1,7 @@
 # Next steps
 
 Roadmap from the current skeleton to a working coding agent. Last reviewed
-2026-10-31, against langgraph 1.2.17, langchain-core 1.7.0,
+2026-11-02, against langgraph 1.2.17, langchain-core 1.7.0,
 langchain-openai 1.7.2, and fastapi 0.149.0.
 
 ## Where things stand
@@ -15,6 +15,8 @@ langchain-openai 1.7.2, and fastapi 0.149.0.
   no loop.
 - Conversations continue across requests that share a `thread_id`, kept in
   an in-memory checkpointer with a TTL and a thread cap (step 2).
+- A validated workspace boundary rejects escapes and denied paths; project
+  instructions are reloaded into the system prompt every turn (step 3).
 - Requests carry an `X-Request-ID` through the logs, provider errors map to
   `502`/`504`, and model calls use the `llm_timeout`/`llm_max_retries`
   settings (step 1).
@@ -58,6 +60,8 @@ When a step lands, update the Architecture and Gotchas sections in
 ---
 
 ## 0. Land current work
+
+**Status: done (2026-10-30).**
 
 `master` has had nothing merged since the first commit. `agent-setup` carries
 the server, LLM client, graph skeleton, the small fixes, `AGENTS.md`,
@@ -194,6 +198,9 @@ without memory growing forever.
 
 ## 3. Workspace boundary and project context
 
+**Status: done (2026-11-02).** `Workspace` is created at startup and injected
+into the graph; context is capped and never stored in message history.
+
 **Goal:** one place decides which files the agent may touch, and the agent
 knows the project it's working in before its first model call.
 
@@ -211,8 +218,9 @@ knows the project it's working in before its first model call.
     dedicated error for anything outside the root (`is_relative_to`). This
     covers `..`, absolute paths, and symlinks that escape.
   - Every later tool goes through it. No tool builds paths on its own.
-  - A deny list inside the workspace for paths the agent must never read or
-    write, at least `.env` and `.git/`. Make it a setting.
+  - Required case-insensitive name patterns `.env*` and `.git` reject
+    matching names at every depth, before and after following symlinks.
+    Configured deny patterns are additive.
 - `common/config.py`: add `workspace_root` and the deny list, and add both to
   `.env.example`. Validate at startup that the root exists and is a
   directory.
@@ -220,7 +228,8 @@ knows the project it's working in before its first model call.
 - `preplanning` loads the workspace's `AGENTS.md` (falling back to
   `README.md`) through `Workspace`, with a size cap, and returns
   `{"context": ...}`. Later it can add a directory overview or the git
-  branch.
+  branch. Inaccessible context files are skipped rather than failing a
+  request.
 - `react` builds the system message from `SYSTEM_PROMPT` plus `context`. It
   stays out of `messages`, for the reasons in step 2.
 - Reload context every turn. It's cheap and the files may change; cache
@@ -488,6 +497,11 @@ developer laptop.
   instance, Postgres for several workers. Move thread ownership and retention
   into the same store, and replace step 2's in-memory eviction with a
   scheduled cleanup.
+- Stop saving project context with every checkpoint. `context` lives in the
+  graph state, so each turn stores another copy of up to
+  `workspace_context_max_chars`. Load it inside `react` instead. Don't use
+  `UntrackedValue`: a run resumed after a 5b approval continues at `react`
+  without rerunning `preplanning`, so it would have no context.
 - A Dockerfile for the service itself, separate from the command sandbox
   image.
 - A run configuration with settings from the environment, and health checks

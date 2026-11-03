@@ -1,9 +1,11 @@
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
+from app.agent.workspace import Workspace
 from app.service import create_app
 from tests.fakes import EchoChatModel
 
@@ -15,9 +17,15 @@ def echo_model() -> EchoChatModel:
 
 
 @pytest.fixture
-def app(echo_model: EchoChatModel) -> FastAPI:
+def workspace(tmp_path: Path) -> Workspace:
+    """Provide an isolated workspace with no project context by default."""
+    return Workspace(tmp_path)
+
+
+@pytest.fixture
+def app(echo_model: EchoChatModel, workspace: Workspace) -> FastAPI:
     """Create an isolated application instance for each test."""
-    return create_app(llm=echo_model)
+    return create_app(llm=echo_model, workspace=workspace)
 
 
 @pytest.fixture
