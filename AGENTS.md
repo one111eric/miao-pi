@@ -49,10 +49,37 @@ Fix formatting with `uv run isort . && uv run black .`.
 Request flow: `POST /invoke` → `app/agent/router.py` → `invoke_agent()` →
 compiled graph `preplanning → react → finalize`.
 
-- `preplanning` prepends the system prompt.
+- `preplanning` is a no-op placeholder (step 3 adds workspace context).
 - `react` calls the LLM, which `build_agent_graph(llm)` injects through
-  `make_react(llm)`. There are no tools or loop yet.
+  `make_react(llm)`. It adds `SYSTEM_PROMPT` in front of the messages at call
+  time; the prompt is never stored in the state. There are no tools or loop
+  yet.
 - `finalize` is a placeholder for post-processing.
+
+State and memory:
+
+- `AgentState.messages` uses the `add_messages` reducer. Nodes return only
+  what they change, typed as `AgentUpdate` (`{"messages": [new]}`), never
+  the whole state.
+- Conversations are keyed by `thread_id` in the run config
+  (`config={"configurable": {"thread_id": ...}}`), not in the state.
+  `invoke_agent` generates one when the request has none, and always returns
+  it.
+- `ThreadStore` (`app/agent/threads.py`) owns the `InMemorySaver` and its
+  retention. Wrap every run in `async with threads.use(thread_id):`.
+  - One run per thread at a time: a second `use()` on a busy thread raises
+    `ThreadBusyError`, which `/invoke` returns as `409`.
+  - Idle threads unused for `thread_ttl` seconds are deleted when a run
+    starts or finishes. When a run finishes, idle threads beyond
+    `max_threads` are deleted, least recently used first. Threads with a run
+    in progress are never deleted, so the cap can be exceeded by the number
+    of concurrent runs. There's no timer.
+  - Starting a run and evicting take `ThreadStore._lock`. A finishing run
+    frees its thread synchronously without the lock, so freeing can't be
+    cancelled or delayed. Eviction therefore re-reads the state after every
+    await, never working from a copy. Deletes can await I/O.
+  - A failed delete is logged, and the thread stays tracked for a retry. It
+    never fails the run that triggered the cleanup.
 
 Around every request:
 
@@ -89,8 +116,10 @@ change its shape.
 ## Testing
 
 - Default test runs must never call a real model. The `app` fixture injects
-  `EchoChatModel` from `tests/conftest.py` through `create_app(llm=...)`.
-  Pass a fake model the same way instead of monkeypatching `LLM`.
+  `EchoChatModel` from `tests/fakes.py` through `create_app(llm=...)`.
+  Pass a fake model the same way instead of monkeypatching `LLM`. The
+  `echo_model` fixture is the same instance; its `calls` record what the
+  model received.
 - Tests that make live LLM calls need a pytest marker (`openai_live`,
   `local_llm_live`) and an env-var `skipif` gate, like
   `tests/integration/test_openai_llm.py`.
@@ -104,7 +133,10 @@ change its shape.
 - The LLM is built at startup, so the server refuses to start when the
   provider is misconfigured (no `OPENAI_API_KEY` for `openai`, or no
   `LLM_BASE_URL` for `local`).
-- `thread_id` is echoed back but not persisted. There is no checkpointer yet.
+- Conversation memory lives in the server process: it's lost on restart and
+  isn't shared between workers, so run a single worker until step 8.
+- Any caller can continue any `thread_id` they know. There's no ownership
+  check until authentication lands (step 5a).
 
 ## Rules
 

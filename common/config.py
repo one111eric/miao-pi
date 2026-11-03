@@ -25,6 +25,8 @@ class SvcSettings(BaseSettings):
     llm_base_url: str | None = None
     llm_timeout: float = Field(default=60, gt=0)
     llm_max_retries: int = Field(default=3, ge=0)
+    thread_ttl: float = Field(default=3600, gt=0)
+    max_threads: int = Field(default=1000, gt=0)
 
     openai_api_key: SecretStr | None = Field(
         default=None,

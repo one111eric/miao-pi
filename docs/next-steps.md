@@ -12,8 +12,9 @@ langchain-openai 1.7.2, and fastapi 0.149.0.
   graph: `create_app(llm=...)` → `build_agent_graph(llm)` → `make_react(llm)`.
   A misconfigured provider stops the server at startup.
 - Graph: `preplanning → react → finalize`, run once per request. No tools,
-  no loop, no memory.
-- `thread_id` is accepted and echoed back but not persisted.
+  no loop.
+- Conversations continue across requests that share a `thread_id`, kept in
+  an in-memory checkpointer with a TTL and a thread cap (step 2).
 - Requests carry an `X-Request-ID` through the logs, provider errors map to
   `502`/`504`, and model calls use the `llm_timeout`/`llm_max_retries`
   settings (step 1).
@@ -113,6 +114,11 @@ and provider failures return meaningful status codes.
 ---
 
 ## 2. Message reducer and in-memory checkpointer
+
+**Status: done (2026-11-01).** Retention lives in `ThreadStore`
+(`app/agent/threads.py`); runs go through `async with threads.use(...)`.
+Beyond the plan below: a thread runs one request at a time (a concurrent
+request gets `409`), and threads with a run in progress are never evicted.
 
 **Goal:** a conversation continues across requests that share a `thread_id`,
 without memory growing forever.
