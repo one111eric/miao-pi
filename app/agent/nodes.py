@@ -8,7 +8,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, SystemMessage
 
 from app.agent.state import AgentState, AgentUpdate
-from app.agent.workspace import Workspace, WorkspaceError
+from app.agent.workspace import Workspace, WorkspaceAccessError, WorkspaceError
 
 logger = logging.getLogger(__name__)
 
@@ -20,20 +20,38 @@ class AgentNode(Protocol):
     def __call__(self, state: AgentState) -> Awaitable[AgentUpdate]: ...
 
 
+def _elapsed_ms(started_at: float) -> float:
+    return round((perf_counter() - started_at) * 1000, 2)
+
+
 def _load_project_context(workspace: Workspace, max_chars: int) -> str:
     for filename in ("AGENTS.md", "README.md"):
         try:
             path = workspace.resolve(filename)
-            if path.is_file():
-                return workspace.read_text(filename, max_chars=max_chars)
+            if not path.is_file():
+                continue
+            content = workspace.read_text(filename, max_chars=max_chars)
         except (WorkspaceError, OSError) as exc:
-            logger.warning(
-                "Skipping inaccessible project context",
-                extra={
-                    "context_file": filename,
-                    "error_type": type(exc).__name__,
-                },
-            )
+            skip_fields: dict[str, object] = {
+                "context_file": filename,
+                "error_type": type(exc).__name__,
+            }
+            if isinstance(exc, WorkspaceAccessError):
+                skip_fields["reason"] = exc.reason
+            logger.warning("Skipping inaccessible project context", extra=skip_fields)
+            continue
+
+        logger.info(
+            "Project context loaded",
+            extra={
+                "context_file": filename,
+                "context_chars": len(content.text),
+                "context_truncated": content.truncated,
+            },
+        )
+        return content.text
+
+    logger.info("No project context found")
     return ""
 
 
@@ -66,12 +84,24 @@ def make_react(llm: BaseChatModel) -> AgentNode:
         system_prompt = SYSTEM_PROMPT
         if context := state.get("context"):
             system_prompt = f"{SYSTEM_PROMPT}\n\nProject context:\n{context}"
-        response = await llm.ainvoke(
-            [SystemMessage(content=system_prompt), *state["messages"]]
-        )
+        try:
+            response = await llm.ainvoke(
+                [SystemMessage(content=system_prompt), *state["messages"]]
+            )
+        except Exception as exc:
+            # Logged here so the failure keeps the thread id and its duration;
+            # the HTTP error mapping happens later, outside the thread context.
+            logger.warning(
+                "LLM call failed",
+                extra={
+                    "model_duration_ms": _elapsed_ms(started_at),
+                    "error_type": type(exc).__name__,
+                },
+            )
+            raise
 
         log_fields: dict[str, object] = {
-            "model_duration_ms": round((perf_counter() - started_at) * 1000, 2),
+            "model_duration_ms": _elapsed_ms(started_at),
         }
         if isinstance(response, AIMessage) and response.usage_metadata is not None:
             log_fields.update(response.usage_metadata)

@@ -100,18 +100,30 @@ Workspace boundary:
   every turn so instruction changes take effect without restarting. An
   inaccessible `AGENTS.md` is skipped in favor of `README.md`; if neither can
   be read, the base prompt is used.
+- Each turn logs which context file was loaded, its size, and whether it was
+  truncated, or that none was found. A skipped file is a warning with its
+  error type and, for `WorkspaceAccessError`, its `reason` (`outside` or
+  `denied`). Never log the context text itself.
 
 Around every request:
 
 - `RequestContextMiddleware` takes a valid `X-Request-ID` (or generates
   one), adds it to the logging context, and returns it in the response
   header. Unhandled errors are logged there and returned as a generic `500`
-  that still carries the header.
+  that still carries the header. It also logs `Request completed` for every
+  request, with method, path (never the query string), status, and duration.
+  uvicorn's access log repeats this without the request id; pass
+  `--no-access-log` where the duplicate is noise.
 - OpenAI provider errors map to `504` (timeout) or `502` (anything else),
   with a generic message. Never put provider error text in a response.
 - Model calls use `llm_timeout` and `llm_max_retries` from `SvcSettings`;
   arguments passed to `LLM(...)` override them. `react` logs each call's
-  duration and token usage.
+  duration and token usage, and a failed call's duration and error type
+  (inside the thread's logging context, which the HTTP error handlers are
+  outside of).
+- `Agent invocation started` carries `thread_supplied`. A supplied thread
+  that finishes with `conversation_message_count=2` had no history: it was
+  new or had expired.
 
 The graph is still a skeleton and will change. Update this section when you
 change its shape.
@@ -162,7 +174,8 @@ change its shape.
   prompt is used.
 - `workspace_root` defaults to the process working directory. Set it
   explicitly in deployment before file-writing tools are enabled, or the
-  service may be able to edit its own checkout.
+  service may be able to edit its own checkout. The `Startup complete` log
+  shows the resolved root and the deny patterns in effect.
 
 ## Rules
 

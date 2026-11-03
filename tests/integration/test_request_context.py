@@ -101,3 +101,31 @@ async def test_unhandled_error_keeps_the_request_id(
     assert response.headers["X-Request-ID"] == "failing-request"
     assert "request_id=failing-request" in rendered_logs
     assert "unexpected bug" not in response.text
+
+
+@pytest.mark.anyio
+async def test_each_request_logs_its_completion(
+    app: FastAPI,
+    client: AsyncClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    app.state.agent_graph = build_agent_graph(BrokenChatModel())
+
+    with caplog.at_level(logging.INFO, logger="app.service.middlewares"):
+        await client.get("/health?token=not-for-logs")
+        await client.post("/invoke", json={"message": ""})
+        await client.post("/invoke", json={"message": "Hello"})
+
+    completed = [
+        record for record in caplog.records if record.message == "Request completed"
+    ]
+    # The path excludes the query string.
+    assert [
+        (
+            record.__dict__["method"],
+            record.__dict__["path"],
+            record.__dict__["status_code"],
+        )
+        for record in completed
+    ] == [("GET", "/health", 200), ("POST", "/invoke", 422), ("POST", "/invoke", 500)]
+    assert all(record.__dict__["duration_ms"] >= 0 for record in completed)

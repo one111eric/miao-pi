@@ -267,6 +267,8 @@ Shared rules:
 - Truncate large outputs and say they were truncated, so the model knows.
 - Return errors (missing file, path outside the workspace) as tool results
   the model can read and react to. Don't raise through the graph.
+- Log each tool call with its name, duration, and outcome, and log a
+  rejected path with `WorkspaceAccessError.reason`. Never log file contents.
 
 **Changes**
 

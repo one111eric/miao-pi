@@ -23,7 +23,12 @@ async def invoke_agent(
     config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
 
     with logging_context(thread_id=thread_id):
-        logger.info("Agent invocation started")
+        # A supplied thread that ends with conversation_message_count=2 had no
+        # history: the caller chose a new id, or the thread had expired.
+        logger.info(
+            "Agent invocation started",
+            extra={"thread_supplied": request.thread_id is not None},
+        )
         async with threads.use(thread_id):
             result = await graph.ainvoke(
                 {"messages": [HumanMessage(content=request.message)]},

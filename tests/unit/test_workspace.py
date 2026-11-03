@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from app.agent.workspace import Workspace, WorkspaceAccessError
+from app.agent.workspace import Workspace, WorkspaceAccessError, WorkspaceText
 
 
 def test_resolves_paths_inside_the_workspace(tmp_path: Path) -> None:
@@ -20,8 +20,9 @@ def test_rejects_paths_outside_the_workspace(tmp_path: Path, path: str) -> None:
     root.mkdir()
     workspace = Workspace(root)
 
-    with pytest.raises(WorkspaceAccessError):
+    with pytest.raises(WorkspaceAccessError) as error:
         workspace.resolve(path)
+    assert error.value.reason == "outside"
 
 
 def test_rejects_symlinks_that_escape_the_workspace(tmp_path: Path) -> None:
@@ -32,8 +33,9 @@ def test_rejects_symlinks_that_escape_the_workspace(tmp_path: Path) -> None:
     (root / "escape").symlink_to(outside, target_is_directory=True)
     workspace = Workspace(root)
 
-    with pytest.raises(WorkspaceAccessError):
+    with pytest.raises(WorkspaceAccessError) as error:
         workspace.resolve("escape/secret.txt")
+    assert error.value.reason == "outside"
 
 
 @pytest.mark.parametrize(
@@ -57,8 +59,9 @@ def test_rejects_denied_paths(tmp_path: Path, path: str) -> None:
     root.mkdir()
     workspace = Workspace(root)
 
-    with pytest.raises(WorkspaceAccessError):
+    with pytest.raises(WorkspaceAccessError) as error:
         workspace.resolve(path)
+    assert error.value.reason == "denied"
 
 
 def test_rejects_a_symlink_alias_to_a_denied_path(tmp_path: Path) -> None:
@@ -66,8 +69,9 @@ def test_rejects_a_symlink_alias_to_a_denied_path(tmp_path: Path) -> None:
     (tmp_path / "alias").symlink_to(".env")
     workspace = Workspace(tmp_path)
 
-    with pytest.raises(WorkspaceAccessError):
+    with pytest.raises(WorkspaceAccessError) as error:
         workspace.resolve("alias")
+    assert error.value.reason == "denied"
 
 
 def test_rejects_a_denied_name_that_links_to_an_allowed_file(tmp_path: Path) -> None:
@@ -127,6 +131,9 @@ def test_caps_read_content_and_marks_truncation(tmp_path: Path) -> None:
     (tmp_path / "README.md").write_text("abcdefghij", encoding="utf-8")
     workspace = Workspace(tmp_path)
 
-    content = workspace.read_text("README.md", max_chars=5)
-
-    assert content == "abcde\n\n[Content truncated]"
+    assert workspace.read_text("README.md", max_chars=5) == WorkspaceText(
+        "abcde\n\n[Content truncated]", truncated=True
+    )
+    assert workspace.read_text("README.md", max_chars=10) == WorkspaceText(
+        "abcdefghij", truncated=False
+    )

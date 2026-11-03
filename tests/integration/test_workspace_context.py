@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 
 import pytest
@@ -6,9 +7,13 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from app.agent.graph import build_agent_graph
 from app.agent.nodes import SYSTEM_PROMPT
-from app.agent.workspace import Workspace, WorkspaceAccessError
+from app.agent.workspace import Workspace, WorkspaceAccessError, WorkspaceText
 from app.service import create_app
 from tests.fakes import EchoChatModel
+
+
+def log_record(caplog: pytest.LogCaptureFixture, message: str) -> logging.LogRecord:
+    return next(record for record in caplog.records if record.message == message)
 
 
 @pytest.mark.anyio
@@ -101,11 +106,21 @@ async def test_removed_context_stops_applying_within_a_thread(
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("failure", ["escape", "denied", "unreadable"])
+@pytest.mark.parametrize(
+    ("failure", "error_type", "reason"),
+    [
+        ("escape", "WorkspaceAccessError", "outside"),
+        ("denied", "WorkspaceAccessError", "denied"),
+        ("unreadable", "PermissionError", None),
+    ],
+)
 async def test_inaccessible_agents_file_falls_back_to_readme(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
     failure: str,
+    error_type: str,
+    reason: str | None,
 ) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
@@ -126,7 +141,7 @@ async def test_inaccessible_agents_file_falls_back_to_readme(
     if failure == "unreadable":
         original_read_text = workspace.read_text
 
-        def fail_for_agents(path: str | Path, *, max_chars: int) -> str:
+        def fail_for_agents(path: str | Path, *, max_chars: int) -> WorkspaceText:
             if Path(path).name == "AGENTS.md":
                 raise PermissionError("unreadable")
             return original_read_text(path, max_chars=max_chars)
@@ -136,22 +151,39 @@ async def test_inaccessible_agents_file_falls_back_to_readme(
     model = EchoChatModel()
     graph = build_agent_graph(model, workspace=workspace)
 
-    await graph.ainvoke({"messages": [HumanMessage(content="Hello")]})
+    with caplog.at_level(logging.INFO, logger="app.agent.nodes"):
+        await graph.ainvoke({"messages": [HumanMessage(content="Hello")]})
 
     prompt = model.calls[0][0].text
     assert "Fallback context." in prompt
     assert "Unavailable context." not in prompt
     assert "Outside context." not in prompt
+    skipped = log_record(caplog, "Skipping inaccessible project context")
+    assert skipped.__dict__["context_file"] == "AGENTS.md"
+    assert skipped.__dict__["error_type"] == error_type
+    assert skipped.__dict__.get("reason") == reason
+    assert log_record(caplog, "Project context loaded").__dict__["context_file"] == (
+        "README.md"
+    )
 
 
 @pytest.mark.anyio
 async def test_startup_builds_workspace_from_settings(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
     monkeypatch.setenv("WORKSPACE_DENIED_PATHS", '["private"]')
     app = create_app(llm=EchoChatModel())
+
+    with caplog.at_level(logging.INFO, logger="app.service"):
+        async with app.router.lifespan_context(app):
+            pass
+    startup = log_record(caplog, "Startup complete")
+    assert startup.__dict__["workspace_root"] == str(tmp_path.resolve())
+    assert startup.__dict__["workspace_denied_patterns"] == [".env*", ".git", "private"]
+    assert startup.__dict__["workspace_context_max_chars"] == 20_000
 
     async with app.router.lifespan_context(app):
         assert app.state.workspace.root == tmp_path.resolve()
@@ -159,3 +191,37 @@ async def test_startup_builds_workspace_from_settings(
             app.state.workspace.resolve("private/file.txt")
         with pytest.raises(WorkspaceAccessError):
             app.state.workspace.resolve(".env")
+
+
+@pytest.mark.anyio
+async def test_loaded_context_is_logged_with_its_size(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    (tmp_path / "AGENTS.md").write_text("x" * 20, encoding="utf-8")
+    graph = build_agent_graph(
+        EchoChatModel(),
+        workspace=Workspace(tmp_path),
+        context_max_chars=10,
+    )
+
+    with caplog.at_level(logging.INFO, logger="app.agent.nodes"):
+        await graph.ainvoke({"messages": [HumanMessage(content="Hello")]})
+
+    loaded = log_record(caplog, "Project context loaded")
+    assert loaded.__dict__["context_file"] == "AGENTS.md"
+    assert loaded.__dict__["context_chars"] == len("x" * 10 + "\n\n[Content truncated]")
+    assert loaded.__dict__["context_truncated"] is True
+
+
+@pytest.mark.anyio
+async def test_missing_context_is_logged(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    graph = build_agent_graph(EchoChatModel(), workspace=Workspace(tmp_path))
+
+    with caplog.at_level(logging.INFO, logger="app.agent.nodes"):
+        await graph.ainvoke({"messages": [HumanMessage(content="Hello")]})
+
+    assert log_record(caplog, "No project context found")

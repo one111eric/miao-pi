@@ -50,3 +50,22 @@ async def test_invoke_rejects_an_empty_message(client: AsyncClient) -> None:
     response = await client.post("/invoke", json={"message": ""})
 
     assert response.status_code == 422
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("thread_id", "supplied"), [(None, False), ("thread-1", True)])
+async def test_invocation_log_says_whether_a_thread_was_supplied(
+    client: AsyncClient,
+    caplog: pytest.LogCaptureFixture,
+    thread_id: str | None,
+    supplied: bool,
+) -> None:
+    with caplog.at_level(logging.INFO, logger="app.agent"):
+        await client.post("/invoke", json={"message": "Hello", "thread_id": thread_id})
+
+    started_log = next(
+        record
+        for record in caplog.records
+        if record.message == "Agent invocation started"
+    )
+    assert started_log.__dict__["thread_supplied"] is supplied

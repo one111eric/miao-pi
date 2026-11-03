@@ -1,5 +1,6 @@
 import logging
 import re
+from time import perf_counter
 from uuid import uuid4
 
 from starlette.datastructures import Headers, MutableHeaders
@@ -40,12 +41,14 @@ class RequestContextMiddleware:
             return
 
         request_id = _request_id_from(scope)
-        response_started = False
+        started_at = perf_counter()
+        # Stays None if the client disconnects before a response starts.
+        status_code: int | None = None
 
         async def send_with_request_id(message: Message) -> None:
-            nonlocal response_started
+            nonlocal status_code
             if message["type"] == "http.response.start":
-                response_started = True
+                status_code = message["status"]
                 response_headers = MutableHeaders(scope=message)
                 response_headers[REQUEST_ID_HEADER] = request_id
             await send(message)
@@ -57,10 +60,22 @@ class RequestContextMiddleware:
                 # Handled here so the error is logged with the request id and
                 # the 500 response still carries the header.
                 logger.exception("Unhandled error while processing request")
-                if response_started:
+                if status_code is not None:
                     raise
                 response = JSONResponse(
                     status_code=500,
                     content={"detail": "Internal server error"},
                 )
                 await response(scope, receive, send_with_request_id)
+            finally:
+                # The query string is left out: it can carry data that
+                # shouldn't reach the logs.
+                logger.info(
+                    "Request completed",
+                    extra={
+                        "method": scope["method"],
+                        "path": scope["path"],
+                        "status_code": status_code,
+                        "duration_ms": round((perf_counter() - started_at) * 1000, 2),
+                    },
+                )

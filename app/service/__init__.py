@@ -47,7 +47,15 @@ def make_on_startup(
             workspace=active_workspace,
             context_max_chars=settings.workspace_context_max_chars,
         )
-        logger.info("Startup complete")
+        # The root defaults to the working directory, so make the choice visible.
+        logger.info(
+            "Startup complete",
+            extra={
+                "workspace_root": str(active_workspace.root),
+                "workspace_denied_patterns": list(active_workspace.denied_patterns),
+                "workspace_context_max_chars": settings.workspace_context_max_chars,
+            },
+        )
 
     return on_startup
 
