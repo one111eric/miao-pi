@@ -37,8 +37,7 @@ def build_agent_graph(
         "preplanning",
         make_preplanning(workspace, context_max_chars),
     )
-    denied_patterns = workspace.denied_patterns if workspace else ()
-    graph_builder.add_node("react", make_react(llm, tools, denied_patterns))
+    graph_builder.add_node("react", make_react(llm, tools, workspace))
     graph_builder.add_node("finalize", finalize)
 
     graph_builder.add_edge(START, "preplanning")

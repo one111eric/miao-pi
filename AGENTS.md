@@ -144,8 +144,10 @@ Workspace boundary:
     deny list is the only protection for secrets: `.gitignore` handling is a
     noise filter for `find` and `grep`, and global or `.git/info/exclude`
     ignore rules aren't read at all.
-  - `react`'s system prompt names the denied patterns, so the model doesn't
-    waste a tool call on them or offer files it can't read.
+  - `react`'s system prompt names the required patterns, so the model
+    doesn't waste a tool call on them or offer files it can't read. It never
+    names configured patterns, only that others exist: operators deny those
+    for being sensitive, and a hosted provider sees every prompt.
   - Patterns are globs matched case-insensitively and Unicode-normalized.
     One without `/` matches a name at any depth; one with `/` is rooted at
     the workspace and covers everything beneath it.
@@ -192,7 +194,8 @@ Test UI (step 4b, plan in `docs/test-ui.md`):
   developer-only route behind the same dependency.
 - The history endpoint (`read_thread_history` in `service.py`) reads the
   last checkpoint with `graph.aget_state`, not through `ThreadStore.use()`,
-  so it works during a run and doesn't refresh the thread's TTL.
+  so it works during a run and doesn't refresh the thread's TTL. It sends
+  `Cache-Control: no-store`, because tool results include file contents.
 - The page renders every reply and tool result with `textContent`; never use
   `innerHTML` or anything else that parses text as HTML or code
   (`tests/unit/test_ui_static.py` checks). It's served with a strict CSP and

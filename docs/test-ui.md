@@ -44,6 +44,8 @@ without `curl`.
     returns `409`.
   - An unknown or evicted thread returns `404`. Validate `thread_id` with the
     same pattern as `AgentRequest`.
+  - Send `Cache-Control: no-store`: tool results include file contents, which
+    no browser or proxy cache should keep.
   - Response: the messages in order, each `{"type": "human" | "ai" | "tool",
     "text": ...}`. AI messages add `tool_calls` (`id`, `name`, `args`); tool
     messages add `tool_call_id`, `name`, and `status`. Leave out the system

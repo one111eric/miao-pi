@@ -91,6 +91,11 @@ class Workspace:
         """Every pattern in effect, required ones first, in folded form."""
         return self._denied_patterns
 
+    @property
+    def has_configured_patterns(self) -> bool:
+        """Whether ``denied_paths`` added anything beyond the required patterns."""
+        return len(self._denied_patterns) > len(REQUIRED_DENIED_PATTERNS)
+
     def _is_denied(self, path: Path) -> bool:
         relative = path.relative_to(self.root)
         folded_parts = tuple(_fold(part) for part in relative.parts)

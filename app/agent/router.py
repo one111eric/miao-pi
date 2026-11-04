@@ -1,7 +1,7 @@
 import logging
 from typing import Annotated, cast
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Path, Request, Response, status
 
 from app.agent.graph import AgentGraph
 from app.agent.models import (
@@ -109,7 +109,10 @@ async def invoke(
 async def thread_messages(
     thread_id: Annotated[str, Path(pattern=THREAD_ID_PATTERN)],
     graph: AgentGraphDependency,
+    response: Response,
 ) -> ThreadHistory:
+    # Tool results include file contents; no browser or proxy should keep them.
+    response.headers["Cache-Control"] = "no-store"
     history = await read_thread_history(graph, thread_id)
     if history is None:
         raise HTTPException(

@@ -7,7 +7,7 @@ import pytest
 from httpx import AsyncClient
 from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
@@ -15,6 +15,8 @@ from langchain_core.tools import tool
 from app.agent.graph import build_agent_graph
 from app.agent.nodes import INTERRUPTED_TOOL_RESULT, STEP_LIMIT_MESSAGE
 from app.agent.service import AgentLimits
+from app.agent.tools import make_read_tools
+from app.agent.workspace import Workspace
 from tests.apps import serve
 from tests.fakes import EchoChatModel, ScriptedChatModel, tool_call
 
@@ -85,7 +87,28 @@ async def test_the_model_reads_a_file_then_answers(
     assert completed.__dict__["tool_status"] == "success"
     assert completed.__dict__["tool_duration_ms"] >= 0
     # The prompt names the blocked paths, so the model doesn't ask for them.
-    assert "can't be read or listed: .env*, .git, .claude." in model.calls[0][0].text
+    prompt = model.calls[0][0].text
+    assert "Paths matching .env*, .git, .claude, at any depth, are blocked" in prompt
+    assert "Other paths may be blocked too." not in prompt
+
+
+@pytest.mark.anyio
+async def test_the_prompt_never_names_configured_deny_patterns(
+    tmp_path: Path,
+) -> None:
+    workspace = Workspace(tmp_path, denied_paths=("acme-merger-*", "payroll.xlsx"))
+    model = ScriptedChatModel(responses=[AIMessage(content="Okay.")])
+    graph = build_agent_graph(
+        model, workspace=workspace, tools=make_read_tools(workspace)
+    )
+
+    await graph.ainvoke({"messages": [HumanMessage(content="Hello")]})
+
+    # Operators deny these for being sensitive; a hosted provider sees the prompt.
+    prompt = model.calls[0][0].text
+    assert "acme-merger" not in prompt
+    assert "payroll" not in prompt
+    assert "Other paths may be blocked too." in prompt
 
 
 @pytest.mark.anyio

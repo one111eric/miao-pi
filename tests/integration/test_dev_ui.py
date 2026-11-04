@@ -103,6 +103,8 @@ async def test_history_shows_tool_calls_and_their_results(tmp_path: Path) -> Non
         response = await client.get("/threads/thread-1/messages")
 
     assert response.status_code == 200
+    # The body holds file contents, which no cache should keep.
+    assert response.headers["cache-control"] == "no-store"
     assert response.json() == {
         "thread_id": "thread-1",
         "messages": [
