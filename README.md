@@ -57,8 +57,10 @@ WORKSPACE_CONTEXT_MAX_CHARS=20000
 ```
 
 Paths outside the workspace and symlink escapes are rejected. The patterns
-`.env*` and `.git` are always denied at any depth; `WORKSPACE_DENIED_PATHS`
-adds to them. Patterns are case-insensitive globs. One without a `/`, such as
+`.env*`, `.git`, and `.claude` (local coding-agent settings) are always denied
+at any depth; `WORKSPACE_DENIED_PATHS` adds to them. Secrets must be covered
+by these patterns: `.gitignore` only keeps noise out of `find` and `grep`, and
+the agent doesn't read your global git ignore file. Patterns are case-insensitive globs. One without a `/`, such as
 `*.pem`, matches a name at any depth. One with a `/`, such as
 `config/private`, is relative to the workspace root and also denies
 everything beneath it. `.env*` intentionally includes `.env.example`, so the
@@ -97,6 +99,23 @@ AGENT_RUN_TIMEOUT=300
 out, the agent stops and says so, and asking it to continue resumes with a
 fresh budget. A run that exceeds `AGENT_RUN_TIMEOUT` seconds returns
 `504 Gateway Timeout`.
+
+## Test UI
+
+A developer page for trying the agent in a browser. It shows each reply, the
+tool calls behind it with their results, and each turn's status, request id,
+and duration. It's off by default; turn it on in `.env`:
+
+```env
+DEV_UI_ENABLED=true
+```
+
+Then start the server as above and open <http://127.0.0.1:9091/ui/>. The
+page also enables `GET /threads/{thread_id}/messages`, which returns a
+conversation's saved messages, tool calls included.
+
+There's no authentication yet, and the page shows file contents the tools
+read, so keep the server bound to `127.0.0.1` (the default) while it's on.
 
 ## LLM client
 

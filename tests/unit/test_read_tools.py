@@ -236,6 +236,7 @@ def test_ls_hides_denied_entries_and_escaping_symlinks(
 ) -> None:
     write(root, ".env", "SECRET=1")
     write(root, ".git/config", "")
+    write(root, ".claude/settings.local.json", "{}")
     write(root, "app.py", "")
     (root.parent / "outside").mkdir()
     (root / "escape").symlink_to(root.parent / "outside")
@@ -397,6 +398,7 @@ def test_grep_never_searches_denied_ignored_binary_or_outside_files(
     write(root, ".env", "SECRET=1\n")
     write(root, "nested/.env.local", "SECRET=2\n")
     write(root, ".git/config", "SECRET=3\n")
+    write(root, ".claude/settings.local.json", "SECRET=7\n")
     write(root, ".gitignore", "ignored.txt\n")
     write(root, "ignored.txt", "SECRET=4\n")
     write(root, "blob.bin", b"SECRET=5\x00")

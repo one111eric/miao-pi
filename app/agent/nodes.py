@@ -12,7 +12,12 @@ from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
 
 from app.agent.state import AgentState, AgentUpdate
-from app.agent.workspace import Workspace, WorkspaceAccessError, WorkspaceError
+from app.agent.workspace import (
+    REQUIRED_DENIED_PATTERNS,
+    Workspace,
+    WorkspaceAccessError,
+    WorkspaceError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -95,12 +100,33 @@ def make_preplanning(
     return preplanning
 
 
-def _system_prompt(context: str | None, tool_names: Sequence[str]) -> str:
+def _blocked_paths_note(workspace: Workspace | None) -> str:
+    """Tell the model which paths it can't read, so it doesn't try or offer them.
+
+    Only the required patterns are named. Configured ones were chosen because
+    their names are sensitive, and a hosted provider would see the prompt.
+    """
+    if workspace is None:
+        return ""
+    note = (
+        f" Paths matching {', '.join(REQUIRED_DENIED_PATTERNS)}, at any depth, "
+        "are blocked and can't be read or listed."
+    )
+    if workspace.has_configured_patterns:
+        note += " Other paths may be blocked too."
+    return note
+
+
+def _system_prompt(
+    context: str | None,
+    tool_names: Sequence[str],
+    blocked_paths_note: str,
+) -> str:
     parts = [SYSTEM_PROMPT]
     if tool_names:
         parts.append(
             f"Inspect the project with these tools: {', '.join(tool_names)}. "
-            "Paths are relative to the project root."
+            f"Paths are relative to the project root.{blocked_paths_note}"
         )
     if context:
         parts.append(f"Project context:\n{context}")
@@ -132,17 +158,27 @@ def _close_dangling_tool_calls(messages: Sequence[AnyMessage]) -> list[AnyMessag
 
 
 # React Node
-def make_react(llm: BaseChatModel, tools: Sequence[BaseTool] = ()) -> AgentNode:
-    """Create the node that invokes the chat model with the given tools bound."""
+def make_react(
+    llm: BaseChatModel,
+    tools: Sequence[BaseTool] = (),
+    workspace: Workspace | None = None,
+) -> AgentNode:
+    """Create the node that invokes the chat model with the given tools bound.
+
+    With a ``workspace``, the prompt says which of its paths are blocked.
+    """
     model: Runnable[LanguageModelInput, AIMessage] = (
         llm.bind_tools(tools) if tools else llm
     )
     tool_names = [tool.name for tool in tools]
+    blocked_paths_note = _blocked_paths_note(workspace)
 
     async def react(state: AgentState) -> AgentUpdate:
         started_at = perf_counter()
         # Added per call rather than stored, so threads never save the prompt.
-        system_prompt = _system_prompt(state.get("context"), tool_names)
+        system_prompt = _system_prompt(
+            state.get("context"), tool_names, blocked_paths_note
+        )
         try:
             response = await model.ainvoke(
                 [

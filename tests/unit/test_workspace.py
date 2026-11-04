@@ -57,6 +57,8 @@ def test_rejects_symlinks_that_escape_the_workspace(tmp_path: Path) -> None:
         ".GIT/config",
         "nested/.env",
         "nested/.git/config",
+        ".claude/settings.local.json",
+        ".Claude",
     ],
 )
 def test_rejects_denied_paths(tmp_path: Path, path: str) -> None:

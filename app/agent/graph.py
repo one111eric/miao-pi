@@ -37,7 +37,7 @@ def build_agent_graph(
         "preplanning",
         make_preplanning(workspace, context_max_chars),
     )
-    graph_builder.add_node("react", make_react(llm, tools))
+    graph_builder.add_node("react", make_react(llm, tools, workspace))
     graph_builder.add_node("finalize", finalize)
 
     graph_builder.add_edge(START, "preplanning")

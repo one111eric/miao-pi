@@ -11,7 +11,10 @@ from pathlib import Path
 from typing import Literal
 
 # `.env*` also covers variants such as `.env.local`, `.envrc`, and `.env-prod`.
-REQUIRED_DENIED_PATTERNS = (".env*", ".git")
+# `.claude` holds local coding-agent settings, whose permission allowlists can
+# carry tokens; it's often kept out of git by a global ignore file, which the
+# tools don't read, so it has to be denied here.
+REQUIRED_DENIED_PATTERNS = (".env*", ".git", ".claude")
 
 
 def _fold(text: str) -> str:
@@ -87,6 +90,11 @@ class Workspace:
     def denied_patterns(self) -> tuple[str, ...]:
         """Every pattern in effect, required ones first, in folded form."""
         return self._denied_patterns
+
+    @property
+    def has_configured_patterns(self) -> bool:
+        """Whether ``denied_paths`` added anything beyond the required patterns."""
+        return len(self._denied_patterns) > len(REQUIRED_DENIED_PATTERNS)
 
     def _is_denied(self, path: Path) -> bool:
         relative = path.relative_to(self.root)

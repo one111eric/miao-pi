@@ -182,7 +182,12 @@ async def test_startup_builds_workspace_from_settings(
             pass
     startup = log_record(caplog, "Startup complete")
     assert startup.__dict__["workspace_root"] == str(tmp_path.resolve())
-    assert startup.__dict__["workspace_denied_patterns"] == [".env*", ".git", "private"]
+    assert startup.__dict__["workspace_denied_patterns"] == [
+        ".env*",
+        ".git",
+        ".claude",
+        "private",
+    ]
     assert startup.__dict__["workspace_context_max_chars"] == 20_000
 
     async with app.router.lifespan_context(app):
