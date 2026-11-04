@@ -75,8 +75,8 @@ async def test_same_thread_continues_the_conversation(
     await send(client, "Hello", "thread-1")
     await send(client, "Again", "thread-1")
 
-    assert summarize(echo_model.calls[1]) == [
-        ("system", SYSTEM_PROMPT),
+    assert echo_model.calls[1][0].text.startswith(SYSTEM_PROMPT)
+    assert summarize(echo_model.calls[1])[1:] == [
         ("human", "Hello"),
         ("ai", "Received: Hello"),
         ("human", "Again"),
@@ -91,8 +91,8 @@ async def test_threads_do_not_share_history(
     await send(client, "Hello", "thread-1")
     await send(client, "Other", "thread-2")
 
-    assert summarize(echo_model.calls[1]) == [
-        ("system", SYSTEM_PROMPT),
+    assert echo_model.calls[1][0].text.startswith(SYSTEM_PROMPT)
+    assert summarize(echo_model.calls[1])[1:] == [
         ("human", "Other"),
     ]
 
@@ -126,7 +126,7 @@ async def test_system_prompt_is_sent_but_not_stored(
 
     first_message = echo_model.calls[0][0]
     assert isinstance(first_message, SystemMessage)
-    assert first_message.text == SYSTEM_PROMPT
+    assert first_message.text.startswith(SYSTEM_PROMPT)
 
     snapshot = await app.state.agent_graph.aget_state(
         {"configurable": {"thread_id": "thread-1"}}

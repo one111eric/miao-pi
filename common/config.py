@@ -32,6 +32,9 @@ class SvcSettings(BaseSettings):
     # Added to the patterns `Workspace` always denies.
     workspace_denied_paths: tuple[str, ...] = ()
     workspace_context_max_chars: int = Field(default=20_000, gt=0)
+    # LangGraph steps per request; each tool round takes two.
+    agent_max_steps: int = Field(default=25, ge=5)
+    agent_run_timeout: float = Field(default=300, gt=0)
 
     openai_api_key: SecretStr | None = Field(
         default=None,

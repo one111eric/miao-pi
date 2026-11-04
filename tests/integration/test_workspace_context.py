@@ -102,7 +102,7 @@ async def test_removed_context_stops_applying_within_a_thread(
     assert "Old instructions." in echo_model.calls[0][0].text
     # Same thread: the earlier turn is in history, but its context is not.
     assert echo_model.calls[1][1].text == "First"
-    assert echo_model.calls[1][0].text == SYSTEM_PROMPT
+    assert "Project context" not in echo_model.calls[1][0].text
 
 
 @pytest.mark.anyio

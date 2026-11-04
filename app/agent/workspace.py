@@ -1,5 +1,10 @@
+import errno
+import io
 import os
+import stat
 import unicodedata
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from pathlib import Path
@@ -51,6 +56,9 @@ class Workspace:
             raise ValueError(f"workspace_root is not a directory: {resolved_root}")
 
         self.root = resolved_root
+        # The root is reopened by path, so remember which directory it is.
+        root_stat = resolved_root.stat()
+        self._root_id = (root_stat.st_dev, root_stat.st_ino)
         # Configured patterns add to the required ones and never replace them.
         self._denied_patterns = tuple(
             dict.fromkeys(
@@ -101,6 +109,9 @@ class Workspace:
 
     def resolve(self, path: str | Path = ".") -> Path:
         """Resolve a path and reject escapes and denied locations."""
+        if "\x00" in os.fspath(path):
+            # The OS would raise ValueError; keep every bad path a WorkspaceError.
+            raise WorkspaceError("path contains a NUL byte")
         candidate = Path(path)
         lexical = Path(
             os.path.abspath(
@@ -131,13 +142,79 @@ class Workspace:
 
         return resolved
 
+    @contextmanager
+    def open_file(self, path: str | Path) -> Iterator[io.BufferedReader]:
+        """Open a regular file inside the workspace for binary reading.
+
+        Opening is non-blocking so a FIFO can't hang the caller, and anything
+        other than a regular file is rejected once open.
+        """
+        resolved = self.resolve(path)
+        fd = self._open_beneath_root(resolved.relative_to(self.root))
+        try:
+            mode = os.fstat(fd).st_mode
+            # POSIX opens directories without complaint; name them explicitly
+            # rather than relying on the file object to refuse one.
+            if stat.S_ISDIR(mode):
+                raise IsADirectoryError(
+                    errno.EISDIR, os.strerror(errno.EISDIR), str(path)
+                )
+            if not stat.S_ISREG(mode):
+                raise WorkspaceError("not a regular file")
+            os.set_blocking(fd, True)
+            file = os.fdopen(fd, "rb")
+        except BaseException:
+            os.close(fd)
+            raise
+        with file:
+            yield file
+
+    def _open_beneath_root(self, relative: Path) -> int:
+        """Open a resolved path one component at a time, never following links.
+
+        ``resolve`` returns a path without symlinks, so meeting one on the way
+        means a component was swapped after the check. Opening each component
+        relative to its parent with ``O_NOFOLLOW`` makes that fail instead of
+        escaping; opening the full path would follow a swapped parent. The root
+        itself is opened by path, so it must still be the directory found at
+        startup (same device and inode).
+        """
+        *parents, name = relative.parts or (".",)
+        directory = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            root_stat = os.fstat(directory)
+            if (root_stat.st_dev, root_stat.st_ino) != self._root_id:
+                raise WorkspaceError("workspace root changed")
+            for part in parents:
+                child = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=directory,
+                )
+                os.close(directory)
+                directory = child
+            return os.open(
+                name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=directory,
+            )
+        except OSError as error:
+            # A symlink (ELOOP) or a file in place of a directory (ENOTDIR).
+            if error.errno in (errno.ELOOP, errno.ENOTDIR):
+                raise WorkspaceError("path changed while opening") from error
+            raise
+        finally:
+            os.close(directory)
+
     def read_text(self, path: str | Path, *, max_chars: int) -> WorkspaceText:
         """Read at most ``max_chars`` and mark truncated content."""
         if max_chars < 1:
             raise ValueError("max_chars must be positive")
 
-        resolved = self.resolve(path)
-        with resolved.open(encoding="utf-8", errors="replace") as file:
+        with (
+            self.open_file(path) as raw,
+            io.TextIOWrapper(raw, encoding="utf-8", errors="replace") as file,
+        ):
             content = file.read(max_chars + 1)
 
         if len(content) <= max_chars:

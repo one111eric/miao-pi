@@ -1,7 +1,7 @@
 # Next steps
 
 Roadmap from the current skeleton to a working coding agent. Last reviewed
-2026-11-02, against langgraph 1.2.17, langchain-core 1.7.0,
+2026-11-03, against langgraph 1.2.17, langchain-core 1.7.0,
 langchain-openai 1.7.2, and fastapi 0.149.0.
 
 ## Where things stand
@@ -11,8 +11,9 @@ langchain-openai 1.7.2, and fastapi 0.149.0.
 - The LLM (`common/llm/LLM`) is built once at startup and injected into the
   graph: `create_app(llm=...)` → `build_agent_graph(llm)` → `make_react(llm)`.
   A misconfigured provider stops the server at startup.
-- Graph: `preplanning → react → finalize`, run once per request. No tools,
-  no loop.
+- Graph: `preplanning → react ⇄ tools → finalize`. The model can loop
+  through four read-only tools (`read`, `ls`, `find`, `grep`) within a step
+  limit and a run timeout (step 4).
 - Conversations continue across requests that share a `thread_id`, kept in
   an in-memory checkpointer with a TTL and a thread cap (step 2).
 - A validated workspace boundary rejects escapes and denied paths; project
@@ -251,69 +252,93 @@ workspace context.
 
 ## 4. ReAct loop and read-only tools
 
+**Status: done (2026-11-03).** The tools follow pi's coding agent
+(<https://github.com/earendil-works/pi/tree/main/packages/coding-agent>,
+`src/core/tools/`); the differences are listed below.
+
 **Goal:** the model can inspect the workspace with tools, repeatedly, until
 it gives a final answer.
 
-**Tools** (all read-only, all through `Workspace`)
+**Tools** (all read-only, all through `Workspace`), with pi's names,
+parameters, and caps:
 
-1. `list_dir(path)`
-2. `read_file(path, start_line?, end_line?)`, with a size cap
-3. `search(pattern, path?)`, a grep-like search with a result cap.
-   Implement it in Python, or run a fixed `rg`/`grep` command with the
-   pattern passed as an argument. Never let the model build a shell command.
+1. `read(path, offset?, limit?)`: 2000 lines or 50KB, whichever comes
+   first; a cut ends with "Use offset=N to continue."
+2. `ls(path?, limit?)`: sorted, `/` after directories, dotfiles included,
+   500 entries.
+3. `find(pattern, path?, limit?)`: glob; a pattern without `/` matches the
+   file name, one with `/` matches the path. 1000 results.
+4. `grep(pattern, path?, glob?, ignore_case?, literal?, context?, limit?)`:
+   `path:line: text`, context lines as `path-line- text`, 100 matches, 500
+   characters per line.
 
 Shared rules:
 
-- Truncate large outputs and say they were truncated, so the model knows.
+- Truncate large outputs and say how to get the rest, so the model knows.
+  Fetch one result past a limit to tell "exactly N" from "more than N".
 - Return errors (missing file, path outside the workspace) as tool results
   the model can read and react to. Don't raise through the graph.
 - Log each tool call with its name, duration, and outcome, and log a
   rejected path with `WorkspaceAccessError.reason`. Never log file contents.
 
+Where miao-pi differs from pi, and why:
+
+- pi trusts the local machine. Here every path goes through `Workspace`:
+  `read` rejects denied and escaping paths, and `ls`, `find`, and `grep`
+  leave them out.
+- pi runs `fd` and `rg`. Here `find` and `grep` walk the tree in Python, so
+  the deny list (case-insensitive, Unicode-normalized, symlink-aware) applies
+  exactly, and nothing needs installing. `.gitignore` support comes from
+  `pathspec`. `grep` uses Python's `re` syntax.
+- pi shows paths relative to the search directory. Here they're relative to
+  the workspace root, so a result can be passed straight back to `read`.
+- pi reads images and suggests `bash` for over-long lines. Here binary files
+  are refused and there's no `bash` until step 6.
+- pi reports a cut read as "lines X-Y of N". Here the notice gives the file
+  size instead, so `read` stops at the cap rather than reading a huge file to
+  the end just to count its lines.
+- pi's local conveniences (`~` expansion, `@` prefixes, macOS screenshot
+  file names) are left out; they don't apply to a server.
+
 **Changes**
 
-- New `app/agent/tools/` package exporting a `READ_TOOLS: list[BaseTool]`.
-  The tools take the `Workspace` from a factory, not from a global.
-- `app/agent/nodes.py`
-  - `make_react(llm, tools)` binds the tools inside:
-    `model = llm.bind_tools(tools)`. Keep the parameter typed as
-    `BaseChatModel`: `bind_tools` returns a `Runnable`, not a chat model.
-- `app/agent/graph.py`
-  - Add a `tools` node: `ToolNode(tools)` (`from langgraph.prebuilt import
-    ToolNode, tools_condition`).
-  - `react → tools_condition → {tools, finalize}`, then `tools → react`.
-- `app/agent/service.py`
-  - Pass `recursion_limit` in the run config (a new setting, for example
-    `agent_max_steps`, default about 25).
-  - Catch `GraphRecursionError` (`from langgraph.errors import
-    GraphRecursionError`) and return a clear error instead of a bare 500.
-  - Add an overall deadline for the whole run (for example
-    `agent_run_timeout` with `asyncio.timeout`). Each model call can take
-    `llm_timeout × (llm_max_retries + 1)`, about 4 minutes with the defaults,
-    and the loop multiplies that by the number of steps.
+- `app/agent/tools/`: `make_read_tools(workspace)`; one module per tool,
+  plus `files.py` (path checks, error mapping, the walker) and `output.py`
+  (caps and notices).
+- `Workspace.open_file`: checks that the root is still the directory found
+  at startup (device and inode), opens each path component relative to its
+  parent with `O_NOFOLLOW`, then the file with `O_NONBLOCK`, and accepts only
+  regular files. That closes the symlink-swap and FIFO gaps noted in step 3:
+  `O_NOFOLLOW` on the full path alone protects only its last component, and
+  reopening the root by path would follow a swapped root. A path with a NUL
+  byte is a `WorkspaceError`.
+- `make_react(llm, tools)` binds the tools; `ToolNode` with
+  `awrap_tool_call=log_tool_call`; `react → tools_condition → {tools,
+  finalize}`, then `tools → react`.
+- `agent_max_steps` (default 25) is the run's `recursion_limit`. Instead of
+  catching `GraphRecursionError`, `react` reads LangGraph's `RemainingSteps`
+  and ends with `STEP_LIMIT_MESSAGE` when another tool round can't fit. A
+  `GraphRecursionError` would have left unanswered tool calls in the thread,
+  and providers reject that history on the next turn.
+- `agent_run_timeout` (default 300 seconds) bounds the whole run and maps to
+  `504`. A timed-out run can still leave unanswered tool calls in the
+  checkpoint, so `react` adds placeholder results when it sends history to
+  the model.
 
-**Tests**
+**Tests:** `ScriptedChatModel` and `tool_call()` in `tests/fakes.py`
+(`EchoChatModel` gained a no-op `bind_tools`); unit tests per tool for caps,
+notices, denied, escaping, ignored, and binary files, and FIFOs; scripted
+runs for read → answer, error results, the step limit at several values,
+and a timeout followed by a recovered turn.
 
-- `EchoChatModel` can't do this: `BaseChatModel.bind_tools` raises
-  `NotImplementedError` by default, and langchain's `GenericFakeChatModel`
-  doesn't override it either. Replace it with a scripted fake:
-  - It takes a list of `AIMessage`s and returns them in order.
-  - `bind_tools` returns `self`.
-  - It records the messages it receives.
-  - Move it to `tests/fakes.py`.
-- Unit tests per tool in a `tmp_path` workspace, including size caps,
-  truncation, and an escape attempt returning an error result.
-- Scripted run "`read_file` call → final answer": the tool runs, its
-  `ToolMessage` reaches the model, and the final text is returned.
-- A model that keeps calling tools stops at the step limit with a clean
-  error.
+**Notes:**
 
-**Done when:** a scripted multi-step run passes, and the step limit is
-enforced.
-
-**Notes:** for the local provider, check that the chosen model supports tool
-calling over the OpenAI-compatible API (many Ollama models do, but not all).
-Document which models are known to work.
+- For the local provider, check that the chosen model supports tool calling
+  over the OpenAI-compatible API (many Ollama models do, but not all).
+  Document which models are known to work.
+- `re` has no timeout, so a pathological `grep` pattern can keep a worker
+  thread busy after the deadline. If that matters, switch to `google-re2`
+  or run `grep` in the step 5c sandbox.
 
 ---
 

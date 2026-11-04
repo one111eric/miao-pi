@@ -61,13 +61,42 @@ Paths outside the workspace and symlink escapes are rejected. The patterns
 adds to them. Patterns are case-insensitive globs. One without a `/`, such as
 `*.pem`, matches a name at any depth. One with a `/`, such as
 `config/private`, is relative to the workspace root and also denies
-everything beneath it. `.env*` intentionally includes `.env.example`, so
-environment templates must be documented separately before file-reading tools
-are added.
+everything beneath it. `.env*` intentionally includes `.env.example`, so the
+agent can't read environment templates either.
 
 `WORKSPACE_ROOT` defaults to the server's current directory. Set it explicitly
 in deployment so future file tools cannot modify the service itself by
 accident.
+
+## Tools
+
+The agent inspects the workspace with four read-only tools, modeled on
+[pi's coding agent](https://github.com/earendil-works/pi/tree/main/packages/coding-agent):
+
+| Tool | Does | Caps |
+| --- | --- | --- |
+| `read` | Reads a text file, with `offset`/`limit` for large ones | 2000 lines or 50KB |
+| `ls` | Lists a directory, including dotfiles | 500 entries |
+| `find` | Finds files by glob pattern | 1000 results |
+| `grep` | Searches file contents (Python regex or literal) | 100 matches, 500 chars per line |
+
+Every output also stops at 50KB, and a cut output ends with a notice telling
+the model how to get the rest. Paths are relative to the workspace root.
+Denied paths are rejected by `read` and never appear in `ls`, `find`, or
+`grep`. `find` and `grep` skip files matched by `.gitignore`, and binary
+files are never shown.
+
+The model can call tools repeatedly within one request, bounded by:
+
+```env
+AGENT_MAX_STEPS=25
+AGENT_RUN_TIMEOUT=300
+```
+
+`AGENT_MAX_STEPS` counts graph steps; each tool round takes two. When it runs
+out, the agent stops and says so, and asking it to continue resumes with a
+fresh budget. A run that exceeds `AGENT_RUN_TIMEOUT` seconds returns
+`504 Gateway Timeout`.
 
 ## LLM client
 

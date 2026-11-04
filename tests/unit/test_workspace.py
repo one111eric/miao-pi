@@ -2,7 +2,12 @@ from pathlib import Path
 
 import pytest
 
-from app.agent.workspace import Workspace, WorkspaceAccessError, WorkspaceText
+from app.agent.workspace import (
+    Workspace,
+    WorkspaceAccessError,
+    WorkspaceError,
+    WorkspaceText,
+)
 
 
 def test_resolves_paths_inside_the_workspace(tmp_path: Path) -> None:
@@ -137,3 +142,49 @@ def test_caps_read_content_and_marks_truncation(tmp_path: Path) -> None:
     assert workspace.read_text("README.md", max_chars=10) == WorkspaceText(
         "abcdefghij", truncated=False
     )
+
+
+@pytest.mark.parametrize(
+    ("swapped", "message"),
+    [
+        ("", "workspace root changed"),
+        ("sub", "path changed while opening"),
+        ("sub/file.txt", "path changed while opening"),
+    ],
+)
+def test_open_file_refuses_a_symlink_swapped_in_after_the_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    swapped: str,
+    message: str,
+) -> None:
+    root = tmp_path / "workspace"
+    (root / "sub").mkdir(parents=True)
+    (root / "sub" / "file.txt").write_text("inside", encoding="utf-8")
+    # The outside tree mirrors the workspace, so every swap finds a file.
+    outside = tmp_path / "outside"
+    (outside / "sub").mkdir(parents=True)
+    (outside / "sub" / "file.txt").write_text("secret", encoding="utf-8")
+    workspace = Workspace(root)
+    check = workspace.resolve
+
+    def check_then_swap(path: str | Path = ".") -> Path:
+        resolved = check(path)
+        target = root / swapped
+        target.rename(tmp_path / "moved")
+        target.symlink_to(outside / swapped)
+        return resolved
+
+    monkeypatch.setattr(workspace, "resolve", check_then_swap)
+
+    with pytest.raises(WorkspaceError, match=message):
+        with workspace.open_file("sub/file.txt") as file:
+            file.read()
+
+
+def test_open_file_names_a_directory(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+
+    with pytest.raises(IsADirectoryError):
+        with Workspace(tmp_path).open_file("src"):
+            pass

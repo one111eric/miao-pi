@@ -1,11 +1,15 @@
 import asyncio
 import logging
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable, Sequence
 from time import perf_counter
-from typing import Protocol
+from typing import Any, Protocol
 
-from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.language_models import BaseChatModel, LanguageModelInput
+from langchain_core.messages import AIMessage, AnyMessage, SystemMessage, ToolMessage
+from langchain_core.runnables import Runnable
+from langchain_core.tools import BaseTool
+from langgraph.prebuilt.tool_node import ToolCallRequest
+from langgraph.types import Command
 
 from app.agent.state import AgentState, AgentUpdate
 from app.agent.workspace import Workspace, WorkspaceAccessError, WorkspaceError
@@ -13,6 +17,21 @@ from app.agent.workspace import Workspace, WorkspaceAccessError, WorkspaceError
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = "You are Miao Pi, a concise and helpful coding assistant."
+
+STEP_LIMIT_MESSAGE = (
+    "I stopped because this request reached its step limit before I finished. "
+    "Ask me to continue and I'll pick up from here."
+)
+
+INTERRUPTED_TOOL_RESULT = (
+    "Not run: the previous request ended before this tool call finished."
+)
+
+# Another tool round needs three more steps: tools, react again, and finalize.
+_STEPS_FOR_TOOL_ROUND = 3
+
+# ToolNode results are a ToolMessage or a Command whose goto can name any node.
+type ToolResult = ToolMessage | Command[Any]
 
 
 class AgentNode(Protocol):
@@ -55,6 +74,7 @@ def _load_project_context(workspace: Workspace, max_chars: int) -> str:
     return ""
 
 
+# Preplanning Node
 def make_preplanning(
     workspace: Workspace | None,
     context_max_chars: int,
@@ -75,18 +95,60 @@ def make_preplanning(
     return preplanning
 
 
-def make_react(llm: BaseChatModel) -> AgentNode:
-    """Create the node that invokes the given chat model."""
+def _system_prompt(context: str | None, tool_names: Sequence[str]) -> str:
+    parts = [SYSTEM_PROMPT]
+    if tool_names:
+        parts.append(
+            f"Inspect the project with these tools: {', '.join(tool_names)}. "
+            "Paths are relative to the project root."
+        )
+    if context:
+        parts.append(f"Project context:\n{context}")
+    return "\n\n".join(parts)
+
+
+def _close_dangling_tool_calls(messages: Sequence[AnyMessage]) -> list[AnyMessage]:
+    """Answer tool calls that a stopped run left without results.
+
+    A run that times out after the model asks for tools saves that request
+    with no answers, and providers reject such a conversation. The
+    placeholders go to the model only; the saved history is unchanged.
+    """
+    answered = {m.tool_call_id for m in messages if isinstance(m, ToolMessage)}
+    closed: list[AnyMessage] = []
+    for message in messages:
+        closed.append(message)
+        if isinstance(message, AIMessage):
+            closed.extend(
+                ToolMessage(
+                    content=INTERRUPTED_TOOL_RESULT,
+                    tool_call_id=call["id"],
+                    status="error",
+                )
+                for call in message.tool_calls
+                if call["id"] is not None and call["id"] not in answered
+            )
+    return closed
+
+
+# React Node
+def make_react(llm: BaseChatModel, tools: Sequence[BaseTool] = ()) -> AgentNode:
+    """Create the node that invokes the chat model with the given tools bound."""
+    model: Runnable[LanguageModelInput, AIMessage] = (
+        llm.bind_tools(tools) if tools else llm
+    )
+    tool_names = [tool.name for tool in tools]
 
     async def react(state: AgentState) -> AgentUpdate:
         started_at = perf_counter()
         # Added per call rather than stored, so threads never save the prompt.
-        system_prompt = SYSTEM_PROMPT
-        if context := state.get("context"):
-            system_prompt = f"{SYSTEM_PROMPT}\n\nProject context:\n{context}"
+        system_prompt = _system_prompt(state.get("context"), tool_names)
         try:
-            response = await llm.ainvoke(
-                [SystemMessage(content=system_prompt), *state["messages"]]
+            response = await model.ainvoke(
+                [
+                    SystemMessage(content=system_prompt),
+                    *_close_dangling_tool_calls(state["messages"]),
+                ]
             )
         except Exception as exc:
             # Logged here so the failure keeps the thread id and its duration;
@@ -103,15 +165,57 @@ def make_react(llm: BaseChatModel) -> AgentNode:
         log_fields: dict[str, object] = {
             "model_duration_ms": _elapsed_ms(started_at),
         }
-        if isinstance(response, AIMessage) and response.usage_metadata is not None:
+        if response.usage_metadata is not None:
             log_fields.update(response.usage_metadata)
         logger.info("LLM call completed", extra=log_fields)
+
+        # Ending here keeps the history valid: a GraphRecursionError would leave
+        # the requested tool calls unanswered.
+        if response.tool_calls and state["remaining_steps"] <= _STEPS_FOR_TOOL_ROUND:
+            logger.warning(
+                "Agent step limit reached",
+                extra={"requested_tool_calls": len(response.tool_calls)},
+            )
+            response = AIMessage(content=STEP_LIMIT_MESSAGE)
 
         return {"messages": [response]}
 
     return react
 
 
+async def log_tool_call(
+    request: ToolCallRequest,
+    execute: Callable[[ToolCallRequest], Awaitable[ToolResult]],
+) -> ToolResult:
+    """Log each tool call's name, outcome, and duration, never its output."""
+    started_at = perf_counter()
+    tool_name = request.tool_call["name"]
+    try:
+        result = await execute(request)
+    except Exception as exc:
+        logger.warning(
+            "Tool call failed",
+            extra={
+                "tool": tool_name,
+                "tool_duration_ms": _elapsed_ms(started_at),
+                "error_type": type(exc).__name__,
+            },
+        )
+        raise
+    logger.info(
+        "Tool call completed",
+        extra={
+            "tool": tool_name,
+            "tool_status": (
+                result.status if isinstance(result, ToolMessage) else "command"
+            ),
+            "tool_duration_ms": _elapsed_ms(started_at),
+        },
+    )
+    return result
+
+
+# Finalize Node
 async def finalize(state: AgentState) -> AgentUpdate:
     """Leave the completed state as is; later post-processing can live here."""
     return {}

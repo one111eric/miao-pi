@@ -5,7 +5,9 @@ from langchain_core.language_models import BaseChatModel
 
 from app.agent import router as agent_router
 from app.agent.graph import build_agent_graph
+from app.agent.service import AgentLimits
 from app.agent.threads import ThreadStore
+from app.agent.tools import make_read_tools
 from app.agent.workspace import Workspace
 from app.health.router import router as health_router
 from app.service.error_handling import register_exception_handlers
@@ -38,14 +40,20 @@ def make_on_startup(
             root=settings.workspace_root,
             denied_paths=settings.workspace_denied_paths,
         )
+        tools = make_read_tools(active_workspace)
         app.state.thread_store = threads
         app.state.workspace = active_workspace
+        app.state.agent_limits = AgentLimits(
+            max_steps=settings.agent_max_steps,
+            run_timeout=settings.agent_run_timeout,
+        )
         # Built once here so a misconfigured provider fails at startup.
         app.state.agent_graph = build_agent_graph(
             llm or LLM(settings=settings),
             checkpointer=threads.checkpointer,
             workspace=active_workspace,
             context_max_chars=settings.workspace_context_max_chars,
+            tools=tools,
         )
         # The root defaults to the working directory, so make the choice visible.
         logger.info(
@@ -54,6 +62,9 @@ def make_on_startup(
                 "workspace_root": str(active_workspace.root),
                 "workspace_denied_patterns": list(active_workspace.denied_patterns),
                 "workspace_context_max_chars": settings.workspace_context_max_chars,
+                "agent_tools": [tool.name for tool in tools],
+                "agent_max_steps": settings.agent_max_steps,
+                "agent_run_timeout": settings.agent_run_timeout,
             },
         )
 
@@ -65,6 +76,7 @@ async def on_shutdown(app: FastAPI) -> None:
     del app.state.agent_graph
     del app.state.thread_store
     del app.state.workspace
+    del app.state.agent_limits
     logger.info("Shutdown complete")
 
 
