@@ -1,4 +1,5 @@
 from enum import StrEnum
+from pathlib import Path
 
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -27,6 +28,13 @@ class SvcSettings(BaseSettings):
     llm_max_retries: int = Field(default=3, ge=0)
     thread_ttl: float = Field(default=3600, gt=0)
     max_threads: int = Field(default=1000, gt=0)
+    workspace_root: Path = Path(".")
+    # Added to the patterns `Workspace` always denies.
+    workspace_denied_paths: tuple[str, ...] = ()
+    workspace_context_max_chars: int = Field(default=20_000, gt=0)
+    # LangGraph steps per request; each tool round takes two.
+    agent_max_steps: int = Field(default=25, ge=5)
+    agent_run_timeout: float = Field(default=300, gt=0)
 
     openai_api_key: SecretStr | None = Field(
         default=None,

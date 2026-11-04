@@ -1,3 +1,4 @@
+import logging
 from typing import Any
 
 import pytest
@@ -11,6 +12,7 @@ from langchain_core.outputs import ChatResult
 from openai import APIError, APITimeoutError
 
 from app.agent.graph import build_agent_graph
+from common.logging_helper import RequestFormatter
 
 
 class TimeoutChatModel(BaseChatModel):
@@ -72,3 +74,35 @@ async def test_provider_error_returns_502_without_details(
     assert response.status_code == 502
     assert response.json() == {"detail": "LLM provider request failed"}
     assert "sensitive provider details" not in response.text
+
+
+@pytest.mark.anyio
+async def test_failed_model_call_is_logged_with_its_thread_and_duration(
+    app: FastAPI,
+    client: AsyncClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    app.state.agent_graph = build_agent_graph(FailingChatModel())
+
+    original_formatter = caplog.handler.formatter
+    caplog.handler.setFormatter(RequestFormatter("%(context)s%(message)s"))
+    try:
+        with caplog.at_level(logging.WARNING, logger="app.agent.nodes"):
+            await client.post(
+                "/invoke",
+                json={"message": "Hello", "thread_id": "thread-1"},
+            )
+        rendered_logs = caplog.text
+    finally:
+        caplog.handler.setFormatter(original_formatter)
+
+    failed_log = next(
+        record for record in caplog.records if record.message == "LLM call failed"
+    )
+    assert failed_log.__dict__["error_type"] == "APIError"
+    assert failed_log.__dict__["model_duration_ms"] >= 0
+    failed_line = next(
+        line for line in rendered_logs.splitlines() if line.endswith("LLM call failed")
+    )
+    assert "thread_id=thread-1" in failed_line
+    assert "sensitive provider details" not in rendered_logs
