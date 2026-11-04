@@ -22,6 +22,10 @@ uv run uvicorn app.service.server:app --reload --port 9091
 The health endpoint is available at <http://127.0.0.1:9091/health>, and the
 OpenAPI documentation is at <http://127.0.0.1:9091/api/v1/docs>.
 
+The service has no authentication yet and is meant to run only on your own
+machine: keep it bound to `127.0.0.1` (uvicorn's default), and don't pass
+`--host 0.0.0.0`.
+
 Invoke the agent:
 
 ```bash

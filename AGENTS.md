@@ -264,7 +264,14 @@ change its shape.
 - Conversation memory lives in the server process: it's lost on restart and
   isn't shared between workers, so run a single worker until step 8.
 - Any caller can continue any `thread_id` they know. There's no ownership
-  check until authentication lands (step 5a).
+  check until authentication lands (step 7b, before anything is reachable
+  beyond the user's machine).
+- The service is meant to run only on the user's machine, bound to
+  `127.0.0.1`. Never start it with `--host 0.0.0.0`. Even so, it accepts any
+  `Host` header, so a web page open in the user's browser can reach it
+  through DNS rebinding. That's an accepted risk until authentication lands
+  in step 7b, including once step 6 adds write and command tools (see
+  `docs/next-steps.md`).
 - The configured workspace root must exist and be a directory. Context files
   are optional; without either `AGENTS.md` or `README.md`, the base system
   prompt is used.
@@ -277,10 +284,10 @@ change its shape.
   Tools run in threads, and threads can't be cancelled.
 - Project files reach the model as tool results, and the model treats them
   as input. A malicious repository can try to steer the agent through them;
-  approval (step 5b) is the safeguard before any tool has side effects.
+  approval (step 5a) is the safeguard before any tool has side effects.
 - With `dev_ui_enabled`, anyone who can reach the server can read any
   thread's history, tool results included. Keep it off outside local
-  development until 5a adds authentication and ownership checks.
+  development until 7b adds authentication and ownership checks.
 
 ## Rules
 
