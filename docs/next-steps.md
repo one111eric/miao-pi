@@ -14,6 +14,8 @@ langchain-openai 1.7.2, and fastapi 0.149.0.
 - Graph: `preplanning → react ⇄ tools → finalize`. The model can loop
   through four read-only tools (`read`, `ls`, `find`, `grep`) within a step
   limit and a run timeout (step 4).
+- With `DEV_UI_ENABLED=true`, a test page at `/ui/` shows each turn's reply
+  and tool calls, backed by `GET /threads/{thread_id}/messages` (step 4b).
 - Conversations continue across requests that share a `thread_id`, kept in
   an in-memory checkpointer with a TTL and a thread cap (step 2).
 - A validated workspace boundary rejects escapes and denied paths; project
@@ -32,6 +34,7 @@ langchain-openai 1.7.2, and fastapi 0.149.0.
 2.  Message reducer + in-memory checkpointer (with retention cap)
 3.  Workspace boundary + project context
 4.  ReAct loop + read-only tools
+4b. Test UI (a developer page for trying the agent)
 5a. Authentication + thread ownership
 5b. Approval (interrupt + resume API)
 5c. Command sandbox
@@ -219,9 +222,11 @@ knows the project it's working in before its first model call.
     dedicated error for anything outside the root (`is_relative_to`). This
     covers `..`, absolute paths, and symlinks that escape.
   - Every later tool goes through it. No tool builds paths on its own.
-  - Required case-insensitive name patterns `.env*` and `.git` reject
-    matching names at every depth, before and after following symlinks.
-    Configured deny patterns are additive.
+  - Required case-insensitive name patterns `.env*`, `.git`, and `.claude`
+    reject matching names at every depth, before and after following
+    symlinks. Configured deny patterns are additive. (`.claude` was added
+    after the first test against a real model: local coding-agent settings
+    are often hidden from git only by a global ignore file.)
 - `common/config.py`: add `workspace_root` and the deny list, and add both to
   `.env.example`. Validate at startup that the root exists and is a
   directory.
@@ -342,6 +347,16 @@ and a timeout followed by a recovered turn.
 
 ---
 
+## 4b. Test UI
+
+**Status: built (2026-11-04)**; the manual check against a real model is
+still to do.
+
+A developer page for trying the agent in a browser, with the tool calls
+and results it made. The plan is in [test-ui.md](test-ui.md).
+
+---
+
 ## 5a. Authentication and thread ownership
 
 **Goal:** only known callers can use the agent, and each caller can only
@@ -360,10 +375,13 @@ reach their own threads.
   by a different caller gets `404`, not `403`, so it doesn't reveal that the
   thread exists.
 - Add the caller id to the logging context.
+- The 4b history endpoint gets the same token check and ownership rule as
+  `/invoke`. The test page gains a token field, keeps the token in
+  `sessionStorage`, and sends it with every request.
 
 **Tests:** missing or wrong token → `401`; `/health` stays open; caller B
-can't continue caller A's thread; with auth disabled, requests work without
-a token.
+can't continue or read caller A's thread; with auth disabled, requests work
+without a token.
 
 **Done when:** the agent routes require a token, and cross-caller access is
 blocked.
@@ -394,6 +412,8 @@ approves or rejects it.
   endpoint.
 - Build and test this with a test-only tool that has a side effect. The real
   write and command tools come in step 6.
+- The 4b test page shows a pending action (tool, arguments, diff) with
+  Approve and Reject buttons that call the resume endpoint.
 
 **Tests:** scripted run → pending action returned → approve → the tool runs
 and the run finishes; reject → the tool doesn't run, and the model sees the
@@ -505,6 +525,9 @@ happen.
   variant of resume if needed.
 - Errors after the stream has started must go out as an `error` event, not
   an HTTP status.
+- Switch the 4b test page to the stream: show tokens and tool activity as
+  they arrive, instead of fetching the history after each reply. Keep the
+  history endpoint for reloading a conversation.
 
 **Tests:** read the response with httpx streaming; with the scripted fake,
 assert the event order for a run with one tool call, a run that pauses for

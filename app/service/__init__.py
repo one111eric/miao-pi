@@ -13,6 +13,7 @@ from app.health.router import router as health_router
 from app.service.error_handling import register_exception_handlers
 from app.service.lifespan import LifespanCallback, lifespan_function
 from app.service.middlewares import RequestContextMiddleware
+from app.ui.router import router as ui_router
 from common.config import SvcSettings
 from common.llm import LLM
 
@@ -43,6 +44,7 @@ def make_on_startup(
         tools = make_read_tools(active_workspace)
         app.state.thread_store = threads
         app.state.workspace = active_workspace
+        app.state.dev_ui_enabled = settings.dev_ui_enabled
         app.state.agent_limits = AgentLimits(
             max_steps=settings.agent_max_steps,
             run_timeout=settings.agent_run_timeout,
@@ -65,6 +67,7 @@ def make_on_startup(
                 "agent_tools": [tool.name for tool in tools],
                 "agent_max_steps": settings.agent_max_steps,
                 "agent_run_timeout": settings.agent_run_timeout,
+                "dev_ui_enabled": settings.dev_ui_enabled,
             },
         )
 
@@ -77,6 +80,7 @@ async def on_shutdown(app: FastAPI) -> None:
     del app.state.thread_store
     del app.state.workspace
     del app.state.agent_limits
+    del app.state.dev_ui_enabled
     logger.info("Shutdown complete")
 
 
@@ -106,5 +110,6 @@ def create_app(
     register_exception_handlers(app)
     app.include_router(agent_router)
     app.include_router(health_router)
+    app.include_router(ui_router)
 
     return app

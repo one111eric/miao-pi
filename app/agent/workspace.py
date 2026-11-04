@@ -11,7 +11,10 @@ from pathlib import Path
 from typing import Literal
 
 # `.env*` also covers variants such as `.env.local`, `.envrc`, and `.env-prod`.
-REQUIRED_DENIED_PATTERNS = (".env*", ".git")
+# `.claude` holds local coding-agent settings, whose permission allowlists can
+# carry tokens; it's often kept out of git by a global ignore file, which the
+# tools don't read, so it has to be denied here.
+REQUIRED_DENIED_PATTERNS = (".env*", ".git", ".claude")
 
 
 def _fold(text: str) -> str:

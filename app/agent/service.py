@@ -3,11 +3,17 @@ import logging
 from dataclasses import dataclass
 from uuid import uuid4
 
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 
 from app.agent.graph import AgentGraph
-from app.agent.models import AgentRequest, AgentResponse
+from app.agent.models import (
+    AgentRequest,
+    AgentResponse,
+    ThreadHistory,
+    ThreadMessage,
+    ToolCallView,
+)
 from app.agent.threads import ThreadStore
 from common.logging_helper import logging_context
 
@@ -83,3 +89,46 @@ async def invoke_agent(
             extra={"conversation_message_count": len(result["messages"])},
         )
         return AgentResponse(response=final_message.text, thread_id=thread_id)
+
+
+def _thread_message(message: AnyMessage) -> ThreadMessage | None:
+    if isinstance(message, HumanMessage):
+        return ThreadMessage(type="human", text=message.text)
+    if isinstance(message, AIMessage):
+        return ThreadMessage(
+            type="ai",
+            text=message.text,
+            tool_calls=[
+                ToolCallView(id=call["id"], name=call["name"], args=call["args"])
+                for call in message.tool_calls
+            ],
+        )
+    if isinstance(message, ToolMessage):
+        return ThreadMessage(
+            type="tool",
+            text=message.text,
+            tool_call_id=message.tool_call_id,
+            name=message.name,
+            status=message.status,
+        )
+    return None
+
+
+async def read_thread_history(
+    graph: AgentGraph,
+    thread_id: str,
+) -> ThreadHistory | None:
+    """Return a thread's saved messages, or ``None`` if it doesn't exist.
+
+    This reads the last checkpoint without ``ThreadStore.use()``, so it works
+    while a run is in progress and doesn't count as using the thread.
+    """
+    snapshot = await graph.aget_state({"configurable": {"thread_id": thread_id}})
+    messages: list[AnyMessage] = snapshot.values.get("messages", [])
+    if not messages:
+        return None
+    views = [_thread_message(message) for message in messages]
+    return ThreadHistory(
+        thread_id=thread_id,
+        messages=[view for view in views if view is not None],
+    )

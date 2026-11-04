@@ -35,6 +35,8 @@ class SvcSettings(BaseSettings):
     # LangGraph steps per request; each tool round takes two.
     agent_max_steps: int = Field(default=25, ge=5)
     agent_run_timeout: float = Field(default=300, gt=0)
+    # Serves the test page and the thread history endpoint. No auth until 5a.
+    dev_ui_enabled: bool = False
 
     openai_api_key: SecretStr | None = Field(
         default=None,

@@ -1,7 +1,11 @@
+import asyncio
 from collections.abc import Callable, Sequence
 from typing import Any
 
-from langchain_core.callbacks import CallbackManagerForLLMRun
+from langchain_core.callbacks import (
+    AsyncCallbackManagerForLLMRun,
+    CallbackManagerForLLMRun,
+)
 from langchain_core.language_models import BaseChatModel, LanguageModelInput
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
@@ -91,6 +95,38 @@ class ScriptedChatModel(BaseChatModel):
         response = self.responses[len(self.calls)].model_copy()
         self.calls.append(list(messages))
         return ChatResult(generations=[ChatGeneration(message=response)])
+
+
+class GatedChatModel(BaseChatModel):
+    """Holds every call until ``release`` is set, so a run stays in flight."""
+
+    started: asyncio.Event = Field(default_factory=asyncio.Event)
+    release: asyncio.Event = Field(default_factory=asyncio.Event)
+
+    @property
+    def _llm_type(self) -> str:
+        return "gated"
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        raise NotImplementedError("only the async path is used")
+
+    async def _agenerate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: AsyncCallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        self.started.set()
+        await self.release.wait()
+        message = AIMessage(content=f"Received: {messages[-1].text}")
+        return ChatResult(generations=[ChatGeneration(message=message)])
 
 
 def tool_call(name: str, call_id: str, **args: object) -> AIMessage:

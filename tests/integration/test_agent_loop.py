@@ -1,13 +1,10 @@
 import asyncio
 import logging
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
 import pytest
-from fastapi import FastAPI
-from httpx import ASGITransport, AsyncClient
+from httpx import AsyncClient
 from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
@@ -18,22 +15,8 @@ from langchain_core.tools import tool
 from app.agent.graph import build_agent_graph
 from app.agent.nodes import INTERRUPTED_TOOL_RESULT, STEP_LIMIT_MESSAGE
 from app.agent.service import AgentLimits
-from app.agent.workspace import Workspace
-from app.service import create_app
+from tests.apps import serve
 from tests.fakes import EchoChatModel, ScriptedChatModel, tool_call
-
-
-@asynccontextmanager
-async def serve(
-    model: BaseChatModel, root: Path
-) -> AsyncIterator[tuple[FastAPI, AsyncClient]]:
-    app = create_app(llm=model, workspace=Workspace(root))
-    async with app.router.lifespan_context(app):
-        transport = ASGITransport(app=app)
-        async with AsyncClient(
-            transport=transport, base_url="http://testserver"
-        ) as client:
-            yield app, client
 
 
 def log_record(caplog: pytest.LogCaptureFixture, message: str) -> logging.LogRecord:
@@ -101,6 +84,8 @@ async def test_the_model_reads_a_file_then_answers(
     assert completed.__dict__["tool"] == "read"
     assert completed.__dict__["tool_status"] == "success"
     assert completed.__dict__["tool_duration_ms"] >= 0
+    # The prompt names the blocked paths, so the model doesn't ask for them.
+    assert "can't be read or listed: .env*, .git, .claude." in model.calls[0][0].text
 
 
 @pytest.mark.anyio

@@ -95,13 +95,24 @@ def make_preplanning(
     return preplanning
 
 
-def _system_prompt(context: str | None, tool_names: Sequence[str]) -> str:
+def _system_prompt(
+    context: str | None,
+    tool_names: Sequence[str],
+    denied_patterns: Sequence[str],
+) -> str:
     parts = [SYSTEM_PROMPT]
     if tool_names:
-        parts.append(
+        tools_line = (
             f"Inspect the project with these tools: {', '.join(tool_names)}. "
             "Paths are relative to the project root."
         )
+        if denied_patterns:
+            # Saves the model a refused tool call, or offering a file it can't read.
+            tools_line += (
+                " Paths matching these patterns, at any depth, are blocked and "
+                f"can't be read or listed: {', '.join(denied_patterns)}."
+            )
+        parts.append(tools_line)
     if context:
         parts.append(f"Project context:\n{context}")
     return "\n\n".join(parts)
@@ -132,8 +143,16 @@ def _close_dangling_tool_calls(messages: Sequence[AnyMessage]) -> list[AnyMessag
 
 
 # React Node
-def make_react(llm: BaseChatModel, tools: Sequence[BaseTool] = ()) -> AgentNode:
-    """Create the node that invokes the chat model with the given tools bound."""
+def make_react(
+    llm: BaseChatModel,
+    tools: Sequence[BaseTool] = (),
+    denied_patterns: Sequence[str] = (),
+) -> AgentNode:
+    """Create the node that invokes the chat model with the given tools bound.
+
+    ``denied_patterns`` are the workspace's, named in the prompt so the model
+    doesn't ask for them.
+    """
     model: Runnable[LanguageModelInput, AIMessage] = (
         llm.bind_tools(tools) if tools else llm
     )
@@ -142,7 +161,9 @@ def make_react(llm: BaseChatModel, tools: Sequence[BaseTool] = ()) -> AgentNode:
     async def react(state: AgentState) -> AgentUpdate:
         started_at = perf_counter()
         # Added per call rather than stored, so threads never save the prompt.
-        system_prompt = _system_prompt(state.get("context"), tool_names)
+        system_prompt = _system_prompt(
+            state.get("context"), tool_names, denied_patterns
+        )
         try:
             response = await model.ainvoke(
                 [

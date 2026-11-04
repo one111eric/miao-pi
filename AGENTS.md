@@ -33,8 +33,12 @@ Fix formatting with `uv run isort . && uv run black .`.
   graph into `app.state`; `create_app(llm=...)` overrides the model.
   `middlewares/` holds the request-id middleware, and `error_handling/` maps
   provider errors to HTTP statuses.
-- `app/<feature>/` — one package per API feature (`agent`, `health`), each
-  with `router.py` and `models.py` (Pydantic request/response models).
+- `app/<feature>/` — one package per API feature (`agent`, `health`, `ui`),
+  each with `router.py` and, where it has request or response bodies,
+  `models.py` (Pydantic models).
+- `app/ui/` — the developer test page: `static/` (`index.html`, `app.js`,
+  `app.css`, no build step), `router.py` serving it under `/ui/`, and
+  `gate.py` (`require_dev_ui`, which hides developer-only routes).
 - `app/agent/` — the LangGraph workflow: `state.py` (graph state),
   `nodes.py` (async node functions), `graph.py` (wiring and compile),
   `service.py` (runs the graph for a request), `workspace.py` (the
@@ -135,8 +139,13 @@ Workspace boundary:
 - `Workspace.resolve()` is the only path boundary for agent code. It rejects
   paths and symlinks outside `workspace_root`, and denied paths both before
   and after following symlinks.
-  - `.env*` and `.git` are always denied (`REQUIRED_DENIED_PATTERNS`);
-    `workspace_denied_paths` adds to them.
+  - `.env*`, `.git`, and `.claude` are always denied
+    (`REQUIRED_DENIED_PATTERNS`); `workspace_denied_paths` adds to them. The
+    deny list is the only protection for secrets: `.gitignore` handling is a
+    noise filter for `find` and `grep`, and global or `.git/info/exclude`
+    ignore rules aren't read at all.
+  - `react`'s system prompt names the denied patterns, so the model doesn't
+    waste a tool call on them or offer files it can't read.
   - Patterns are globs matched case-insensitively and Unicode-normalized.
     One without `/` matches a name at any depth; one with `/` is rooted at
     the workspace and covers everything beneath it.
@@ -175,6 +184,25 @@ Around every request:
   duration. A rejected path logs `Tool path rejected` with the tool, the
   requested path, and its `reason`. Never log tool output.
 
+Test UI (step 4b, plan in `docs/test-ui.md`):
+
+- `dev_ui_enabled` (default off) gates the page and
+  `GET /threads/{thread_id}/messages`. Startup copies it to `app.state`, and
+  `require_dev_ui` returns FastAPI's own `404` when it's off. Put any other
+  developer-only route behind the same dependency.
+- The history endpoint (`read_thread_history` in `service.py`) reads the
+  last checkpoint with `graph.aget_state`, not through `ThreadStore.use()`,
+  so it works during a run and doesn't refresh the thread's TTL.
+- The page renders every reply and tool result with `textContent`; never use
+  `innerHTML` or anything else that parses text as HTML or code
+  (`tests/unit/test_ui_static.py` checks). It's served with a strict CSP and
+  no inline script or style, so keep JavaScript in `app.js` and CSS in
+  `app.css`. All API calls go through `apiBase` in `app.js`.
+- The page picks a new conversation's `thread_id` itself
+  (`crypto.randomUUID()`), so a first turn that the server saved but answered
+  with an error (`502`, `504`) still shows up. Error responses carry no
+  `thread_id`.
+
 The graph is still a skeleton and will change. Update this section when you
 change its shape.
 
@@ -210,6 +238,13 @@ change its shape.
 - Unit-test tools by invoking them with a tool-call dict, the way `ToolNode`
   does, so errors come back as `ToolMessage(status="error")` (see `call` in
   `tests/unit/test_read_tools.py`).
+- `serve(model, root)` in `tests/apps.py` runs the app with its lifespan, a
+  given model, and a workspace, when the `client` fixture's `EchoChatModel`
+  won't do. `GatedChatModel` in `tests/fakes.py` holds every call until
+  `release` is set, to test behavior while a run is in progress.
+- Tests that need the test UI set `app.state.dev_ui_enabled` explicitly, so a
+  developer's `.env` can't change the result. The page's JavaScript has no
+  automated tests; check it by hand (see `docs/test-ui.md`).
 - Tests that make live LLM calls need a pytest marker (`openai_live`,
   `local_llm_live`) and an env-var `skipif` gate, like
   `tests/integration/test_openai_llm.py`.
@@ -240,6 +275,9 @@ change its shape.
 - Project files reach the model as tool results, and the model treats them
   as input. A malicious repository can try to steer the agent through them;
   approval (step 5b) is the safeguard before any tool has side effects.
+- With `dev_ui_enabled`, anyone who can reach the server can read any
+  thread's history, tool results included. Keep it off outside local
+  development until 5a adds authentication and ownership checks.
 
 ## Rules
 

@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>miao-pi test UI</title>
+    <link rel="stylesheet" href="app.css">
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <header>
+      <h1>miao-pi</h1>
+      <div class="thread">
+        <span class="label">Thread</span>
+        <code id="thread-id">new</code>
+        <button id="new-thread" type="button">New conversation</button>
+      </div>
+    </header>
+
+    <main id="transcript" aria-live="polite"></main>
+
+    <form id="composer">
+      <textarea
+        id="message"
+        rows="3"
+        placeholder="Ask about the project (Ctrl/Cmd+Enter to send)"
+        required
+      ></textarea>
+      <div class="actions">
+        <span id="status" class="status"></span>
+        <button id="send" type="submit">Send</button>
+      </div>
+    </form>
+  </body>
+</html>

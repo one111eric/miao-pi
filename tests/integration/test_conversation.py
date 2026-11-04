@@ -1,55 +1,15 @@
 import asyncio
-from typing import Any
 from uuid import UUID
 
 import pytest
 from fastapi import FastAPI
 from httpx import AsyncClient
-from langchain_core.callbacks import (
-    AsyncCallbackManagerForLLMRun,
-    CallbackManagerForLLMRun,
-)
-from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
-from langchain_core.outputs import ChatGeneration, ChatResult
-from pydantic import Field
 
 from app.agent.graph import build_agent_graph
 from app.agent.nodes import SYSTEM_PROMPT
 from app.agent.threads import ThreadStore
-from tests.fakes import EchoChatModel
-
-
-class GatedChatModel(BaseChatModel):
-    """Holds every call until ``release`` is set, so a run stays in flight."""
-
-    started: asyncio.Event = Field(default_factory=asyncio.Event)
-    release: asyncio.Event = Field(default_factory=asyncio.Event)
-
-    @property
-    def _llm_type(self) -> str:
-        return "gated"
-
-    def _generate(
-        self,
-        messages: list[BaseMessage],
-        stop: list[str] | None = None,
-        run_manager: CallbackManagerForLLMRun | None = None,
-        **kwargs: Any,
-    ) -> ChatResult:
-        raise NotImplementedError("only the async path is used")
-
-    async def _agenerate(
-        self,
-        messages: list[BaseMessage],
-        stop: list[str] | None = None,
-        run_manager: AsyncCallbackManagerForLLMRun | None = None,
-        **kwargs: Any,
-    ) -> ChatResult:
-        self.started.set()
-        await self.release.wait()
-        message = AIMessage(content=f"Received: {messages[-1].text}")
-        return ChatResult(generations=[ChatGeneration(message=message)])
+from tests.fakes import EchoChatModel, GatedChatModel
 
 
 def summarize(messages: list[BaseMessage]) -> list[tuple[str, str]]:
