@@ -44,7 +44,7 @@ Fix formatting with `uv run isort . && uv run black .`.
   `service.py` (runs or resumes the graph for a request), `approval.py`
   (pausing for a human before tools with side effects), `workspace.py` (the
   boundary for project files), and `tools/` (the read-only tools, one module
-  each, plus shared `files.py` and `output.py`).
+  each, plus `tool_utils/` with the shared `files.py` and `output.py`).
 - `common/` — code shared across features: `config.py` (`SvcSettings`),
   `llm/` (`LLM`, a `ChatOpenAI` subclass), `logging_helper.py`.
 - `tests/unit/` — no network, no app lifespan.
@@ -113,14 +113,15 @@ Tools (`app/agent/tools/`):
   shaped after pi's coding agent: same names, parameters, caps (2000 lines or
   50KB, 500 entries, 1000 results, 100 matches), and actionable truncation
   notices. Results are relative to the workspace root.
-- Every path goes through `Workspace`. `files.resolve_for_tool` and
-  `files.open_for_tool` turn workspace and OS errors into `ToolException`s;
-  each tool sets `handle_tool_error=True`, so they reach the model as error
-  results. Only bugs propagate. Never put an absolute server path in a tool
-  result.
-- `find` and `grep` walk the tree in Python (`files.iter_files`) instead of
-  running `fd`/`rg`, so the deny list and `.gitignore` (via `pathspec`)
-  apply exactly. Denied and escaping entries are hidden, not reported.
+- Every path goes through `Workspace`. `tool_utils.files.resolve_for_tool`
+  and `tool_utils.files.open_for_tool` turn workspace and OS errors into
+  `ToolException`s; each tool sets `handle_tool_error=True`, so they reach
+  the model as error results. Only bugs propagate. Never put an absolute
+  server path in a tool result.
+- `find` and `grep` walk the tree in Python (`tool_utils.files.iter_files`)
+  instead of running `fd`/`rg`, so the deny list and `.gitignore` (via
+  `pathspec`) apply exactly. Denied and escaping entries are hidden, not
+  reported.
 - `Workspace.open_file` is the only way to read file contents. It walks
   from the root one component at a time, each opened relative to its parent
   (`dir_fd`) with `O_NOFOLLOW`, so a symlink swapped in anywhere along the

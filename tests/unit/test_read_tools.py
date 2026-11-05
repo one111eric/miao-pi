@@ -11,7 +11,7 @@ from langchain_core.tools import BaseTool
 
 from app.agent.approval import approval_tool_names
 from app.agent.tools import make_read_tools, read
-from app.agent.tools.output import format_size, iter_lines
+from app.agent.tools.tool_utils.output import format_size, iter_lines
 from app.agent.workspace import Workspace
 
 

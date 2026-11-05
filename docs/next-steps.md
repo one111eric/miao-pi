@@ -325,8 +325,8 @@ Where miao-pi differs from pi, and why:
 **Changes**
 
 - `app/agent/tools/`: `make_read_tools(workspace)`; one module per tool,
-  plus `files.py` (path checks, error mapping, the walker) and `output.py`
-  (caps and notices).
+  plus `tool_utils/files.py` (path checks, error mapping, the walker) and
+  `tool_utils/output.py` (caps and notices).
 - `Workspace.open_file`: checks that the root is still the directory found
   at startup (device and inode), opens each path component relative to its
   parent with `O_NOFOLLOW`, then the file with `O_NONBLOCK`, and accepts only
