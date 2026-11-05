@@ -1,17 +1,16 @@
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Sequence
 from time import perf_counter
-from typing import Any, Protocol
 
 from langchain_core.language_models import BaseChatModel, LanguageModelInput
 from langchain_core.messages import AIMessage, AnyMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import Runnable
 from langchain_core.tools import BaseTool
 from langgraph.prebuilt.tool_node import ToolCallRequest
-from langgraph.types import Command
 
-from app.agent.state import AgentState, AgentUpdate
+from app.agent.approval import ToolExecutor, ToolResult
+from app.agent.state import AgentNode, AgentState, AgentUpdate
 from app.agent.workspace import (
     REQUIRED_DENIED_PATTERNS,
     Workspace,
@@ -33,15 +32,9 @@ INTERRUPTED_TOOL_RESULT = (
 )
 
 # Another tool round needs three more steps: tools, react again, and finalize.
+# A round through approve needs none extra: the run pauses there, and the
+# resumed run gets a fresh step budget.
 _STEPS_FOR_TOOL_ROUND = 3
-
-# ToolNode results are a ToolMessage or a Command whose goto can name any node.
-type ToolResult = ToolMessage | Command[Any]
-
-
-class AgentNode(Protocol):
-    # LangGraph matches nodes by the parameter name, so a Callable alias won't do.
-    def __call__(self, state: AgentState) -> Awaitable[AgentUpdate]: ...
 
 
 def _elapsed_ms(started_at: float) -> float:
@@ -221,7 +214,7 @@ def make_react(
 
 async def log_tool_call(
     request: ToolCallRequest,
-    execute: Callable[[ToolCallRequest], Awaitable[ToolResult]],
+    execute: ToolExecutor,
 ) -> ToolResult:
     """Log each tool call's name, outcome, and duration, never its output."""
     started_at = perf_counter()

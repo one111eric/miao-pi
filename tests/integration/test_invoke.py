@@ -25,8 +25,10 @@ async def test_invoke_agent(
 
     assert response.status_code == 200
     assert response.json() == {
+        "status": "completed",
         "response": "Received: Hello",
         "thread_id": "thread-1",
+        "actions": [],
     }
     model_log = next(
         record for record in caplog.records if record.message == "LLM call completed"

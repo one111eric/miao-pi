@@ -15,8 +15,10 @@ const statusLine = document.getElementById("status");
 
 let threadId = loadThreadId();
 let history = [];
-// HTTP status, request id, and duration of each turn sent from this page,
-// keyed by the turn's position among the thread's human messages.
+// Tool calls the paused run is waiting on, from the history endpoint.
+let pendingActions = [];
+// Status lines for requests sent from this page (a message, then any
+// approvals), keyed by the turn's position among the thread's human messages.
 const turnInfo = new Map();
 // An error to show after the transcript, such as a turn that wasn't saved.
 let notice = null;
@@ -62,6 +64,10 @@ function humanCount() {
   return history.filter((message) => message.type === "human").length;
 }
 
+function addTurnInfo(turn, info) {
+  turnInfo.set(turn, [...(turnInfo.get(turn) ?? []), info]);
+}
+
 function formatArgs(args) {
   const text = Object.entries(args)
     .map(([key, value]) => `${key}=${JSON.stringify(value)}`)
@@ -71,25 +77,59 @@ function formatArgs(args) {
 
 function formatInfo(info) {
   const parts = [info.status ? `HTTP ${info.status}` : "no response"];
+  if (info.label) parts.unshift(info.label);
   if (info.requestId) parts.push(`request ${info.requestId}`);
   parts.push(`${(info.ms / 1000).toFixed(1)}s`);
   return parts.join(" · ");
 }
 
-function renderToolCall(call, result) {
+function renderToolCall(call, result, waiting) {
   const block = element("details", "tool-call");
   const summary = element("summary");
-  const state = result ? (result.status ?? "success") : "no result";
+  let state = "no result";
+  let output = "The run ended before this tool call finished.";
+  if (result) {
+    state = result.status ?? "success";
+    output = result.text;
+  } else if (waiting) {
+    state = "awaiting approval";
+    output = "Waiting for your decision below.";
+  }
   summary.append(
     element("span", "tool-name", call.name),
     element("span", "tool-args", `(${formatArgs(call.args)})`),
-    element("span", `tool-status ${state.replace(" ", "-")}`, state),
+    element("span", `tool-status ${state.replaceAll(" ", "-")}`, state),
   );
-  const output = result
-    ? result.text
-    : "The run ended before this tool call finished.";
   block.append(summary, element("pre", "tool-result", output));
   return block;
+}
+
+function renderApproval() {
+  const card = element("section", "approval");
+  card.append(element("div", "approval-title", "The agent wants to run:"));
+  for (const action of pendingActions) {
+    const item = element("div", "approval-action");
+    item.append(
+      element("span", "tool-name", action.tool),
+      element("pre", "approval-args", JSON.stringify(action.args, null, 2)),
+    );
+    card.append(item);
+  }
+  const note = element("textarea", "approval-note");
+  note.rows = 2;
+  note.placeholder = "Optional note for the agent, sent with a rejection";
+  const reject = element("button", "reject", "Reject");
+  const approve = element("button", "approve", "Approve");
+  for (const button of [reject, approve]) {
+    button.type = "button";
+    button.disabled = busy;
+  }
+  reject.addEventListener("click", () => decide(false, note.value.trim()));
+  approve.addEventListener("click", () => decide(true, note.value.trim()));
+  const buttons = element("div", "actions");
+  buttons.append(reject, approve);
+  card.append(note, buttons);
+  return card;
 }
 
 function renderNotice(current) {
@@ -104,14 +144,15 @@ function renderTranscript() {
       .filter((message) => message.type === "tool")
       .map((message) => [message.tool_call_id, message]),
   );
+  const waiting = new Set(pendingActions.map((action) => action.tool_call_id));
   const shown = new Set();
   transcript.replaceChildren();
 
   let turn = -1;
   let turnNode = null;
   const closeTurn = () => {
-    if (turnNode && turnInfo.has(turn)) {
-      turnNode.append(element("div", "turn-info", formatInfo(turnInfo.get(turn))));
+    for (const info of (turnNode && turnInfo.get(turn)) ?? []) {
+      turnNode.append(element("div", "turn-info", formatInfo(info)));
     }
   };
   const currentTurn = () => {
@@ -133,15 +174,18 @@ function renderTranscript() {
       for (const call of message.tool_calls) {
         const result = results.get(call.id);
         if (result) shown.add(result);
-        currentTurn().append(renderToolCall(call, result));
+        currentTurn().append(renderToolCall(call, result, waiting.has(call.id)));
       }
     } else if (!shown.has(message)) {
       // A result whose call isn't in the history; show it on its own.
-      currentTurn().append(renderToolCall({ name: message.name ?? "tool", args: {} }, message));
+      currentTurn().append(
+        renderToolCall({ name: message.name ?? "tool", args: {} }, message, false),
+      );
     }
   }
   closeTurn();
 
+  if (pendingActions.length) transcript.append(renderApproval());
   if (notice) transcript.append(renderNotice(notice));
   transcript.lastElementChild?.scrollIntoView({ block: "end" });
 }
@@ -155,7 +199,6 @@ async function errorText(response) {
   }
   if (Array.isArray(detail)) detail = detail.map((item) => item.msg).join("; ");
   const known = {
-    409: "This conversation already has a request running.",
     500: "The server hit an unexpected error. Look up the request id in the logs.",
     502: "The LLM provider request failed.",
   };
@@ -165,6 +208,7 @@ async function errorText(response) {
 async function refreshHistory({ isNew = false } = {}) {
   if (!threadId) {
     history = [];
+    pendingActions = [];
     return;
   }
   try {
@@ -174,10 +218,12 @@ async function refreshHistory({ isNew = false } = {}) {
     if (response.status === 404 && isNew) {
       // A first message that never reached the thread; keep the id for a retry.
       history = [];
+      pendingActions = [];
       return;
     }
     if (response.status === 404) {
       history = [];
+      pendingActions = [];
       turnInfo.clear();
       saveThreadId(null);
       notice = {
@@ -189,17 +235,62 @@ async function refreshHistory({ isNew = false } = {}) {
       notice = { text: `Couldn't load the conversation: ${await errorText(response)}` };
       return;
     }
-    history = (await response.json()).messages;
+    const body = await response.json();
+    history = body.messages;
+    pendingActions = body.pending_actions ?? [];
   } catch {
     notice = { text: "Couldn't reach the server to load the conversation." };
   }
 }
 
+function updateControls() {
+  // A paused run takes a decision, not a new message.
+  sendButton.disabled = busy || pendingActions.length > 0;
+  newThreadButton.disabled = busy;
+  // The card is drawn while the request that paused the run is still busy.
+  for (const button of transcript.querySelectorAll(".approval button")) {
+    button.disabled = busy;
+  }
+  if (!busy) {
+    statusLine.textContent = pendingActions.length ? "Waiting for your approval" : "";
+  }
+}
+
 function setBusy(value) {
   busy = value;
-  sendButton.disabled = value;
-  newThreadButton.disabled = value;
-  if (!value) statusLine.textContent = "";
+  updateControls();
+}
+
+async function post(path, body, waitingText) {
+  const started = performance.now();
+  const timer = setInterval(() => {
+    const seconds = ((performance.now() - started) / 1000).toFixed(1);
+    statusLine.textContent = `${waitingText} ${seconds}s`;
+  }, 100);
+  try {
+    const response = await fetch(`${apiBase}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const info = {
+      status: response.status,
+      requestId: response.headers.get("X-Request-ID"),
+      ms: performance.now() - started,
+    };
+    if (response.ok) info.data = await response.json();
+    else info.error = await errorText(response);
+    return info;
+  } catch {
+    return {
+      status: null,
+      requestId: null,
+      ms: performance.now() - started,
+      error: "Couldn't reach the server.",
+    };
+  } finally {
+    clearInterval(timer);
+  }
 }
 
 async function send(text) {
@@ -208,11 +299,6 @@ async function send(text) {
   const before = humanCount();
   const isNew = !threadId;
   if (isNew) saveThreadId(newThreadId());
-  const started = performance.now();
-  const timer = setInterval(() => {
-    const seconds = ((performance.now() - started) / 1000).toFixed(1);
-    statusLine.textContent = `Waiting for the agent... ${seconds}s`;
-  }, 100);
 
   const pending = element("section", "turn pending");
   pending.append(element("div", "message human", text));
@@ -220,30 +306,12 @@ async function send(text) {
   pending.scrollIntoView({ block: "end" });
 
   const body = threadId ? { message: text, thread_id: threadId } : { message: text };
-  let info;
-  try {
-    const response = await fetch(`${apiBase}/invoke`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    info = {
-      status: response.status,
-      requestId: response.headers.get("X-Request-ID"),
-      ms: performance.now() - started,
-    };
-    if (response.ok) saveThreadId((await response.json()).thread_id);
-    else info.error = await errorText(response);
-  } catch {
-    info = { status: null, requestId: null, ms: performance.now() - started };
-    info.error = "Couldn't reach the server.";
-  } finally {
-    clearInterval(timer);
-  }
+  const info = await post("/invoke", body, "Waiting for the agent...");
+  if (info.data) saveThreadId(info.data.thread_id);
 
   await refreshHistory({ isNew });
   const saved = humanCount() > before;
-  if (saved) turnInfo.set(humanCount() - 1, info);
+  if (saved) addTurnInfo(humanCount() - 1, info);
   if (info.error) {
     // A saved turn already shows its status line; don't repeat it.
     notice = { text: info.error, info: saved ? null : info };
@@ -255,10 +323,31 @@ async function send(text) {
   input.focus();
 }
 
+async function decide(approved, note) {
+  if (busy || !threadId) return;
+  setBusy(true);
+  notice = null;
+  renderTranscript();
+
+  const info = await post(
+    `/threads/${encodeURIComponent(threadId)}/resume`,
+    { approved, note: note || null },
+    approved ? "Approved; continuing..." : "Rejected; continuing...",
+  );
+  info.label = approved ? "Approved" : "Rejected";
+
+  await refreshHistory();
+  addTurnInfo(humanCount() - 1, info);
+  if (info.error) notice = { text: info.error, info: null };
+  renderTranscript();
+  setBusy(false);
+  input.focus();
+}
+
 form.addEventListener("submit", (event) => {
   event.preventDefault();
   const text = input.value.trim();
-  if (busy || !text) return;
+  if (busy || pendingActions.length || !text) return;
   input.value = "";
   send(text);
 });
@@ -273,11 +362,16 @@ input.addEventListener("keydown", (event) => {
 newThreadButton.addEventListener("click", () => {
   saveThreadId(null);
   history = [];
+  pendingActions = [];
   turnInfo.clear();
   notice = null;
   renderTranscript();
+  updateControls();
   input.focus();
 });
 
 saveThreadId(threadId);
-refreshHistory().then(renderTranscript);
+refreshHistory().then(() => {
+  renderTranscript();
+  updateControls();
+});

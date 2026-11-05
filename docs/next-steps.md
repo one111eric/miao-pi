@@ -16,6 +16,10 @@ langchain-openai 1.7.2, and fastapi 0.149.0.
   limit and a run timeout (step 4).
 - With `DEV_UI_ENABLED=true`, a test page at `/ui/` shows each turn's reply
   and tool calls, backed by `GET /threads/{thread_id}/messages` (step 4b).
+- Tools marked as needing approval pause the run; `/invoke` returns
+  `awaiting_approval` with the actions, and
+  `POST /threads/{thread_id}/resume` approves or rejects them (step 5a). No
+  shipped tool needs it yet.
 - Conversations continue across requests that share a `thread_id`, kept in
   an in-memory checkpointer with a TTL and a thread cap (step 2).
 - A validated workspace boundary rejects escapes and denied paths; project
@@ -371,6 +375,20 @@ and results it made. The plan is in [test-ui.md](test-ui.md).
 ---
 
 ## 5a. Approval: interrupt and resume
+
+**Status: done (2026-11-04).** Two changes from the plan below:
+
+- The `interrupt` lives in its own `approve` node, between `react` and
+  `tools`, not inside each tool. On resume LangGraph reruns the whole
+  interrupted node, and `ToolNode` would rerun every call in it. A gate in
+  front of each tool call also refuses an approval-requiring call without an
+  approved decision, so a routing mistake fails closed.
+- A paused run returns `actions` (a list): one model response can ask for
+  several tools at once, and one decision covers them all. Diffs come with
+  the write tools in step 6.
+
+`/invoke` on a waiting thread returns `409`, because a new run would
+silently drop the pending one.
 
 **Goal:** the agent pauses before any action with side effects, and a human
 approves or rejects it.

@@ -220,3 +220,67 @@ button:disabled {
   opacity: 0.5;
   cursor: default;
 }
+
+.tool-status.awaiting-approval {
+  color: var(--accent);
+}
+
+.approval {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.75rem 0.8rem;
+  border: 1px solid var(--accent);
+  border-radius: 0.5rem;
+  background: var(--panel);
+}
+
+.approval-title {
+  font-weight: 600;
+}
+
+.approval-action {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.approval-args {
+  margin: 0;
+  padding: 0.5rem 0.6rem;
+  border-radius: 0.4rem;
+  background: var(--bg);
+  overflow: auto;
+  max-height: 16rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 0.85rem;
+}
+
+.approval-note {
+  width: 100%;
+  resize: vertical;
+  padding: 0.5rem 0.6rem;
+  border-radius: 0.4rem;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+}
+
+.approval .actions {
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 0;
+}
+
+button.approve {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #ffffff;
+}
+
+button.reject {
+  color: var(--error);
+  border-color: var(--error);
+}

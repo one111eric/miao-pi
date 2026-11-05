@@ -137,4 +137,7 @@ and code rendering, choose a framework then, as its own package with its own
 CI.
 
 **Notes:** steps 5a, 7, and 7b in [next-steps.md](next-steps.md) each
-extend the page; their sections say how.
+extend the page; their sections say how. 5a's part is done: a paused run
+shows its pending actions with an optional note and Approve and Reject
+buttons, Send is disabled until you decide, and the history endpoint's
+`pending_actions` brings the card back after a reload.

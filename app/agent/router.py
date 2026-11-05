@@ -1,4 +1,6 @@
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Annotated, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Request, Response, status
@@ -8,13 +10,18 @@ from app.agent.models import (
     THREAD_ID_PATTERN,
     AgentRequest,
     AgentResponse,
+    ResumeRequest,
     ThreadHistory,
 )
 from app.agent.service import (
     AgentLimits,
     AgentRunTimeoutError,
+    NothingToApproveError,
+    ThreadAwaitingApprovalError,
+    ThreadNotFoundError,
     invoke_agent,
     read_thread_history,
+    resume_agent,
 )
 from app.agent.threads import ThreadBusyError, ThreadStore
 from app.ui.gate import require_dev_ui
@@ -59,26 +66,14 @@ ThreadStoreDependency = Annotated[ThreadStore, Depends(get_thread_store)]
 AgentLimitsDependency = Annotated[AgentLimits, Depends(get_agent_limits)]
 
 
-@router.post(
-    "/invoke",
-    response_model=AgentResponse,
-    description=(
-        "Send one message to the coding agent. Pass the returned thread_id "
-        "to continue the conversation."
-    ),
-    responses={
-        409: {"description": "The thread already has a run in progress"},
-        504: {"description": "The run or the LLM provider timed out"},
-    },
-)
-async def invoke(
-    request: AgentRequest,
-    graph: AgentGraphDependency,
-    threads: ThreadStoreDependency,
-    limits: AgentLimitsDependency,
-) -> AgentResponse:
+ThreadIdPath = Annotated[str, Path(pattern=THREAD_ID_PATTERN)]
+
+
+@contextmanager
+def run_errors_as_http() -> Iterator[None]:
+    """Map the failures /invoke and resume share to HTTP errors."""
     try:
-        return await invoke_agent(request, graph, threads, limits)
+        yield
     except ThreadBusyError as error:
         logger.info(
             "Agent invocation rejected",
@@ -96,6 +91,81 @@ async def invoke(
         ) from error
 
 
+@router.post(
+    "/invoke",
+    response_model=AgentResponse,
+    description=(
+        "Send one message to the coding agent. Pass the returned thread_id "
+        "to continue the conversation. If the agent asks for a tool that needs "
+        "approval, the response has status awaiting_approval and lists the "
+        "actions; decide with POST /threads/{thread_id}/resume."
+    ),
+    responses={
+        409: {
+            "description": (
+                "The thread already has a run in progress, or is waiting for "
+                "an approval"
+            )
+        },
+        504: {"description": "The run or the LLM provider timed out"},
+    },
+)
+async def invoke(
+    request: AgentRequest,
+    graph: AgentGraphDependency,
+    threads: ThreadStoreDependency,
+    limits: AgentLimitsDependency,
+) -> AgentResponse:
+    with run_errors_as_http():
+        try:
+            return await invoke_agent(request, graph, threads, limits)
+        except ThreadAwaitingApprovalError as error:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Thread is waiting for an approval; resume it first",
+            ) from error
+
+
+@router.post(
+    "/threads/{thread_id}/resume",
+    response_model=AgentResponse,
+    description=(
+        "Approve or reject every action a paused thread is waiting on, and "
+        "continue the run. A rejection reaches the model as the tool's result."
+    ),
+    responses={
+        404: {"description": "No such thread"},
+        409: {
+            "description": (
+                "Nothing is waiting for approval, or the thread already has a "
+                "run in progress"
+            )
+        },
+        504: {"description": "The run or the LLM provider timed out"},
+    },
+)
+async def resume(
+    thread_id: ThreadIdPath,
+    request: ResumeRequest,
+    graph: AgentGraphDependency,
+    threads: ThreadStoreDependency,
+    limits: AgentLimitsDependency,
+) -> AgentResponse:
+    with run_errors_as_http():
+        try:
+            return await resume_agent(thread_id, request, graph, threads, limits)
+        except ThreadNotFoundError as error:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Thread not found",
+            ) from error
+        except NothingToApproveError as error:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Thread has nothing waiting for approval",
+            ) from error
+
+
 @router.get(
     "/threads/{thread_id}/messages",
     response_model=ThreadHistory,
@@ -107,7 +177,7 @@ async def invoke(
     responses={404: {"description": "No such thread, or the test UI is off"}},
 )
 async def thread_messages(
-    thread_id: Annotated[str, Path(pattern=THREAD_ID_PATTERN)],
+    thread_id: ThreadIdPath,
     graph: AgentGraphDependency,
     response: Response,
 ) -> ThreadHistory:

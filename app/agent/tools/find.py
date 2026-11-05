@@ -4,6 +4,7 @@ from pathlib import PurePosixPath
 from langchain_core.tools import BaseTool, StructuredTool, ToolException
 from pydantic import BaseModel, Field
 
+from app.agent.approval import REQUIRES_APPROVAL
 from app.agent.tools.files import (
     display_path,
     glob_matcher,
@@ -85,4 +86,5 @@ def make_find_tool(workspace: Workspace) -> BaseTool:
         description=DESCRIPTION,
         args_schema=FindArgs,
         handle_tool_error=True,
+        metadata={REQUIRES_APPROVAL: True},
     )

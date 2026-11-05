@@ -41,7 +41,8 @@ Fix formatting with `uv run isort . && uv run black .`.
   `gate.py` (`require_dev_ui`, which hides developer-only routes).
 - `app/agent/` — the LangGraph workflow: `state.py` (graph state),
   `nodes.py` (async node functions), `graph.py` (wiring and compile),
-  `service.py` (runs the graph for a request), `workspace.py` (the
+  `service.py` (runs or resumes the graph for a request), `approval.py`
+  (pausing for a human before tools with side effects), `workspace.py` (the
   boundary for project files), and `tools/` (the read-only tools, one module
   each, plus shared `files.py` and `output.py`).
 - `common/` — code shared across features: `config.py` (`SvcSettings`),
@@ -53,7 +54,9 @@ Fix formatting with `uv run isort . && uv run black .`.
 ## Architecture
 
 Request flow: `POST /invoke` → `app/agent/router.py` → `invoke_agent()` →
-compiled graph `preplanning → react ⇄ tools → finalize`.
+compiled graph `preplanning → react ⇄ [approve →] tools → finalize`.
+`POST /threads/{thread_id}/resume` → `resume_agent()` continues a run paused
+in `approve`.
 
 - `preplanning` reloads `AGENTS.md` (falling back to `README.md`) from the
   workspace on every turn, with a configured size cap.
@@ -61,10 +64,40 @@ compiled graph `preplanning → react ⇄ tools → finalize`.
   through `make_react(llm, tools)`, binding the tools there. It builds a
   system message from `SYSTEM_PROMPT`, the tool names, and the current
   workspace context at call time; none of it is stored in message history.
-- `tools` is LangGraph's `ToolNode`, reached through `tools_condition` and
-  looping back to `react` until the model answers without a tool call.
-  `log_tool_call` wraps every call. Without tools, `react` goes straight to
-  `finalize`.
+- `tools` is LangGraph's `ToolNode`, reached through
+  `make_route_after_react` and looping back to `react` until the model
+  answers without a tool call. Each call goes through `log_tool_call`, then
+  the approval gate. Without tools, `react` goes straight to `finalize`.
+
+Approval (`app/agent/approval.py`):
+
+- A tool opts in with `metadata={REQUIRES_APPROVAL: True}`; none of the read
+  tools do. If any call in a model response needs approval, the route goes
+  to `approve` instead of `tools`.
+- `approve` calls LangGraph's `interrupt` once, listing every
+  approval-requiring call in that response, and the run pauses in the
+  checkpoint. `invoke_agent` sees `__interrupt__` and returns
+  `awaiting_approval` with the actions. One decision covers them all.
+- On resume (`Command(resume=decision)`), `approve` runs again from the top;
+  `interrupt` then returns the decision instead of pausing, and `approve`
+  records it in `state["approvals"]` by tool call id. Keep `approve` free of
+  side effects before `interrupt`, since it always runs twice.
+- The gate in front of every tool call refuses an approval-requiring call
+  unless its recorded decision approved it, returning an error
+  `ToolMessage` (`rejection_text`), so a routing bug fails closed. Rejected
+  calls reach the model as that error result; other calls in the same
+  response run normally.
+- The interrupt lives in its own node rather than inside each tool: on
+  resume LangGraph reruns the whole interrupted node, and `ToolNode` would
+  rerun every call in it.
+- A new `/invoke` on a waiting thread gets `409` (`ThreadAwaitingApprovalError`),
+  because a fresh run would silently drop the pending one. Resume returns
+  `404` for an unknown thread and `409` when nothing waits. Both go through
+  `ThreadStore.use()`, like `/invoke`.
+- An approval round needs no extra step budget: the run pauses in `approve`,
+  and each resume gets a fresh step budget.
+- Decisions are logged as `Approval decision received` (approved, tool
+  names), never with arguments.
 - `finalize` is a placeholder for post-processing.
 
 Tools (`app/agent/tools/`):
@@ -241,9 +274,13 @@ change its shape.
 - Unit-test tools by invoking them with a tool-call dict, the way `ToolNode`
   does, so errors come back as `ToolMessage(status="error")` (see `call` in
   `tests/unit/test_read_tools.py`).
-- `serve(model, root)` in `tests/apps.py` runs the app with its lifespan, a
-  given model, and a workspace, when the `client` fixture's `EchoChatModel`
-  won't do. `GatedChatModel` in `tests/fakes.py` holds every call until
+- `serve(model, root, extra_tools)` in `tests/apps.py` runs the app with its
+  lifespan, a given model, and a workspace, when the `client` fixture's
+  `EchoChatModel` won't do. `recording_tool(effects)` in `tests/fakes.py` is
+  a tool that needs approval and records what it did.
+- A graph swapped into `app.state.agent_graph` needs
+  `checkpointer=app.state.thread_store.checkpointer`, like the real one:
+  `invoke_agent` reads saved state to check for a pending approval. `GatedChatModel` in `tests/fakes.py` holds every call until
   `release` is set, to test behavior while a run is in progress.
 - Tests that need the test UI set `app.state.dev_ui_enabled` explicitly, so a
   developer's `.env` can't change the result. The page's JavaScript has no
