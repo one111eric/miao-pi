@@ -92,8 +92,15 @@ Approval (`app/agent/approval.py`):
   rerun every call in it.
 - A new `/invoke` on a waiting thread gets `409` (`ThreadAwaitingApprovalError`),
   because a fresh run would silently drop the pending one. Resume returns
-  `404` for an unknown thread and `409` when nothing waits. Both go through
-  `ThreadStore.use()`, like `/invoke`.
+  `404` for an unknown thread and `409` when nothing waits. Resume holds
+  the thread with `ThreadStore.use_existing()`, which raises
+  `ThreadNotFoundError` without tracking the id: with `use()`, an unknown id
+  would count toward `max_threads` and its cleanup could evict a real
+  thread.
+- `react` gives any tool call that arrives without an id one
+  (`call_<hex>`), because approval, the gate, and tool results all match
+  calls by id. If a run still pauses with no actions, `invoke_agent` raises
+  rather than report it as completed.
 - An approval round needs no extra step budget: the run pauses in `approve`,
   and each resume gets a fresh step budget.
 - Decisions are logged as `Approval decision received` (approved, tool
@@ -152,7 +159,9 @@ State and memory:
   `invoke_agent` generates one when the request has none, and always returns
   it.
 - `ThreadStore` (`app/agent/threads.py`) owns the `InMemorySaver` and its
-  retention. Wrap every run in `async with threads.use(thread_id):`.
+  retention. Wrap every run in `async with threads.use(thread_id):`, or
+  `threads.use_existing(thread_id)` for a request that can only continue a
+  thread (it never tracks an unknown id).
   - One run per thread at a time: a second `use()` on a busy thread raises
     `ThreadBusyError`, which `/invoke` returns as `409`.
   - Idle threads unused for `thread_ttl` seconds are deleted when a run
@@ -316,6 +325,11 @@ change its shape.
   explicitly in deployment before file-writing tools are enabled, or the
   service may be able to edit its own checkout. The `Startup complete` log
   shows the resolved root and the deny patterns in effect.
+- The run timeout cancels the run, which can't stop a synchronous tool in
+  its worker thread: the call can finish after the `504` with no result
+  saved. The next turn's placeholder therefore says the call may or may not
+  have run. Step 6 must replace this with a deadline that stops between
+  steps, before any side-effecting tool lands (see `docs/next-steps.md`).
 - `grep` uses Python's `re`, which has no timeout: a pathological pattern can
   keep a worker thread busy after the run deadline cancels the request.
   Tools run in threads, and threads can't be cancelled.

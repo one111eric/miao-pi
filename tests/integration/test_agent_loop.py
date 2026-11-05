@@ -223,3 +223,5 @@ async def test_a_timed_out_run_returns_504_and_its_thread_recovers(
         ("ToolMessage", INTERRUPTED_TOOL_RESULT),
         ("HumanMessage", "Try again"),
     ]
+    # The call may have finished in its worker thread after the timeout.
+    assert "may or may not have run" in INTERRUPTED_TOOL_RESULT

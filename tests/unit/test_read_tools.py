@@ -9,6 +9,7 @@ import pytest
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool
 
+from app.agent.approval import approval_tool_names
 from app.agent.tools import make_read_tools, read
 from app.agent.tools.output import format_size, iter_lines
 from app.agent.workspace import Workspace
@@ -24,6 +25,11 @@ def root(tmp_path: Path) -> Path:
 @pytest.fixture
 def tools(root: Path) -> dict[str, BaseTool]:
     return {tool.name: tool for tool in make_read_tools(Workspace(root))}
+
+
+def test_no_read_tool_needs_approval(tools: dict[str, BaseTool]) -> None:
+    # Only tools with side effects pause the run.
+    assert approval_tool_names(list(tools.values())) == frozenset()
 
 
 def call(tool: BaseTool, **args: object) -> ToolMessage:

@@ -4,7 +4,6 @@ from pathlib import Path
 from langchain_core.tools import BaseTool, StructuredTool, ToolException
 from pydantic import BaseModel, Field
 
-from app.agent.approval import REQUIRES_APPROVAL
 from app.agent.tools.files import resolve_for_tool, scan_dir
 from app.agent.tools.output import MAX_BYTES, format_size, take_head, with_notices
 from app.agent.workspace import Workspace, WorkspaceError
@@ -70,5 +69,4 @@ def make_ls_tool(workspace: Workspace) -> BaseTool:
         description=DESCRIPTION,
         args_schema=LsArgs,
         handle_tool_error=True,
-        metadata={REQUIRES_APPROVAL: True},
     )

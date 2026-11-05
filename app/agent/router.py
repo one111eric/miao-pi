@@ -18,12 +18,11 @@ from app.agent.service import (
     AgentRunTimeoutError,
     NothingToApproveError,
     ThreadAwaitingApprovalError,
-    ThreadNotFoundError,
     invoke_agent,
     read_thread_history,
     resume_agent,
 )
-from app.agent.threads import ThreadBusyError, ThreadStore
+from app.agent.threads import ThreadBusyError, ThreadNotFoundError, ThreadStore
 from app.ui.gate import require_dev_ui
 
 logger = logging.getLogger(__name__)

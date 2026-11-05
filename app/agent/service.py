@@ -20,7 +20,7 @@ from app.agent.models import (
     ToolCallView,
 )
 from app.agent.state import AgentState, ApprovalDecision
-from app.agent.threads import ThreadStore
+from app.agent.threads import ThreadNotFoundError, ThreadStore
 from common.logging_helper import logging_context
 
 logger = logging.getLogger(__name__)
@@ -51,14 +51,6 @@ class ThreadAwaitingApprovalError(Exception):
 
     def __init__(self, thread_id: str) -> None:
         super().__init__(f"Thread {thread_id} is waiting for approval")
-        self.thread_id = thread_id
-
-
-class ThreadNotFoundError(Exception):
-    """Raised when a thread has no saved state."""
-
-    def __init__(self, thread_id: str) -> None:
-        super().__init__(f"Thread {thread_id} not found")
         self.thread_id = thread_id
 
 
@@ -113,7 +105,11 @@ async def _run(
 
 
 def _response(thread_id: str, result: dict[str, Any]) -> AgentResponse:
-    actions = _pending_actions(result.get("__interrupt__", []))
+    interrupts = result.get("__interrupt__", [])
+    actions = _pending_actions(interrupts)
+    if interrupts and not actions:
+        # Reporting this as completed would hide a paused run.
+        raise RuntimeError("Agent run paused with nothing to approve")
     if actions:
         logger.info(
             "Agent paused for approval",
@@ -187,7 +183,7 @@ async def resume_agent(
     config = _config(thread_id, limits)
 
     with logging_context(thread_id=thread_id):
-        async with threads.use(thread_id):
+        async with threads.use_existing(thread_id):
             snapshot = await graph.aget_state(config)
             if not snapshot.values.get("messages"):
                 raise ThreadNotFoundError(thread_id)

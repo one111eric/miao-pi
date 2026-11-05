@@ -2,9 +2,11 @@ import asyncio
 import logging
 from collections.abc import Sequence
 from time import perf_counter
+from uuid import uuid4
 
 from langchain_core.language_models import BaseChatModel, LanguageModelInput
 from langchain_core.messages import AIMessage, AnyMessage, SystemMessage, ToolMessage
+from langchain_core.messages.tool import tool_call
 from langchain_core.runnables import Runnable
 from langchain_core.tools import BaseTool
 from langgraph.prebuilt.tool_node import ToolCallRequest
@@ -27,8 +29,12 @@ STEP_LIMIT_MESSAGE = (
     "Ask me to continue and I'll pick up from here."
 )
 
+# A timed-out run can't stop a tool already running in a worker thread, so
+# the call may have finished after all; saying "not run" could get it repeated.
 INTERRUPTED_TOOL_RESULT = (
-    "Not run: the previous request ended before this tool call finished."
+    "No result: the previous request ended before this tool call finished, so "
+    "it may or may not have run. Check before repeating anything with side "
+    "effects."
 )
 
 # Another tool round needs three more steps: tools, react again, and finalize.
@@ -151,6 +157,28 @@ def _close_dangling_tool_calls(messages: Sequence[AnyMessage]) -> list[AnyMessag
 
 
 # React Node
+def _with_tool_call_ids(response: AIMessage) -> AIMessage:
+    """Give every tool call an id; some providers leave it out.
+
+    Approval, the tool gate, and tool results all match calls by id, so a
+    call without one would slip through all three.
+    """
+    if all(call["id"] is not None for call in response.tool_calls):
+        return response
+    return response.model_copy(
+        update={
+            "tool_calls": [
+                tool_call(
+                    name=call["name"],
+                    args=call["args"],
+                    id=call["id"] or f"call_{uuid4().hex}",
+                )
+                for call in response.tool_calls
+            ]
+        }
+    )
+
+
 def make_react(
     llm: BaseChatModel,
     tools: Sequence[BaseTool] = (),
@@ -197,6 +225,8 @@ def make_react(
         if response.usage_metadata is not None:
             log_fields.update(response.usage_metadata)
         logger.info("LLM call completed", extra=log_fields)
+
+        response = _with_tool_call_ids(response)
 
         # Ending here keeps the history valid: a GraphRecursionError would leave
         # the requested tool calls unanswered.

@@ -99,6 +99,10 @@ def make_approve(approval_tools: frozenset[str]) -> AgentNode:
         if not isinstance(message, AIMessage):
             return {}
         actions = pending_actions(message, approval_tools)
+        if not actions:
+            # Nothing to show a human (react gives every call an id, so this
+            # shouldn't happen); the gate in front of the tools refuses them.
+            return {}
         # On resume this node runs again from the top, and interrupt returns
         # the decision instead of pausing. One decision covers every action.
         decision = _parse_decision(interrupt({"actions": actions}))

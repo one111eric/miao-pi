@@ -3,7 +3,7 @@ import logging
 import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 
 from langgraph.checkpoint.memory import InMemorySaver
 
@@ -15,6 +15,14 @@ class ThreadBusyError(Exception):
 
     def __init__(self, thread_id: str) -> None:
         super().__init__(f"Thread {thread_id} already has a run in progress")
+        self.thread_id = thread_id
+
+
+class ThreadNotFoundError(Exception):
+    """Raised when a request must continue a thread that doesn't exist."""
+
+    def __init__(self, thread_id: str) -> None:
+        super().__init__(f"Thread {thread_id} not found")
         self.thread_id = thread_id
 
 
@@ -52,18 +60,28 @@ class ThreadStore:
         self._lock = asyncio.Lock()
 
     @asynccontextmanager
-    async def use(self, thread_id: str) -> AsyncIterator[None]:
+    async def use(
+        self,
+        thread_id: str,
+        *,
+        must_exist: bool = False,
+    ) -> AsyncIterator[None]:
         """Hold a thread for the duration of one run.
 
         Raises ``ThreadBusyError`` if the thread already has a run in
         progress. Expired threads are deleted on entry, so an expired thread
-        starts fresh instead of loading its old checkpoint.
+        starts fresh instead of loading its old checkpoint. With
+        ``must_exist``, an untracked thread raises ``ThreadNotFoundError``.
         """
         async with self._lock:
             if thread_id in self._active:
                 raise ThreadBusyError(thread_id)
             now = self._clock()
             await self._evict_expired(now)
+            # Checked after expiry, and before tracking: an unknown id must
+            # not count toward the cap, or its cleanup would evict a real one.
+            if must_exist and thread_id not in self._last_used:
+                raise ThreadNotFoundError(thread_id)
             # Nothing awaits after this, so a cancellation can't leave the
             # thread marked active without the release below.
             self._active.add(thread_id)
@@ -83,6 +101,10 @@ class ThreadStore:
     def _mark_used(self, thread_id: str, now: float) -> None:
         self._last_used[thread_id] = now
         self._last_used.move_to_end(thread_id)
+
+    def use_existing(self, thread_id: str) -> AbstractAsyncContextManager[None]:
+        """Like ``use``, for a request that can only continue a thread."""
+        return self.use(thread_id, must_exist=True)
 
     def _oldest_idle(self) -> str | None:
         return next((t for t in self._last_used if t not in self._active), None)

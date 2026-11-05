@@ -5,10 +5,12 @@ import pytest
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 
+from app.agent.graph import build_agent_graph
 from app.agent.nodes import STEP_LIMIT_MESSAGE
 from app.agent.service import AgentLimits
+from app.agent.threads import ThreadStore
 from tests.apps import serve
-from tests.fakes import ScriptedChatModel, recording_tool, tool_call
+from tests.fakes import EchoChatModel, ScriptedChatModel, recording_tool, tool_call
 
 PENDING_RECORD = {
     "tool_call_id": "call-1",
@@ -254,3 +256,56 @@ async def test_the_step_limit_leaves_room_for_an_approval(
         ("Done.", ["hello"]),
         (STEP_LIMIT_MESSAGE, []),
     ]
+
+
+@pytest.mark.anyio
+async def test_resuming_an_unknown_thread_leaves_real_ones_alone(
+    tmp_path: Path,
+) -> None:
+    model = EchoChatModel()
+
+    async with serve(model, tmp_path) as (app, client):
+        threads = ThreadStore(ttl=3600, max_threads=1)
+        app.state.thread_store = threads
+        app.state.agent_graph = build_agent_graph(
+            model, checkpointer=threads.checkpointer
+        )
+        await client.post("/invoke", json={"message": "Keep me", "thread_id": "real"})
+        unknown = await client.post("/threads/fake/resume", json={"approved": True})
+        await client.post(
+            "/invoke", json={"message": "Still here?", "thread_id": "real"}
+        )
+
+    assert unknown.status_code == 404
+    # "real" kept its history: an unknown id never counted toward the cap.
+    assert [message.text for message in model.calls[-1][1:]] == [
+        "Keep me",
+        "Received: Keep me",
+        "Still here?",
+    ]
+
+
+@pytest.mark.anyio
+async def test_a_tool_call_without_an_id_still_waits_for_approval(
+    tmp_path: Path,
+) -> None:
+    effects: list[str] = []
+    no_id = AIMessage(
+        content="",
+        tool_calls=[
+            {"name": "record", "args": {"text": "x"}, "id": None, "type": "tool_call"}
+        ],
+    )
+    model = ScriptedChatModel(responses=[no_id, AIMessage(content="Done.")])
+
+    async with serve(model, tmp_path, [recording_tool(effects)]) as (_, client):
+        paused = await client.post("/invoke", json={"message": "Go", "thread_id": "t1"})
+        done = await client.post("/threads/t1/resume", json={"approved": True})
+
+    assert paused.json()["status"] == "awaiting_approval"
+    (action,) = paused.json()["actions"]
+    assert action["tool"] == "record"
+    assert action["tool_call_id"].startswith("call_")
+    assert done.json()["response"] == "Done."
+    assert effects == ["x"]
+    assert last_tool_result(model.calls[1]).tool_call_id == action["tool_call_id"]

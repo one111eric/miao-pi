@@ -491,6 +491,31 @@ the accepted risk under Order.
 - Command output is truncated and capped like the read tools.
 - Combine with the read tools into `TOOLS` in `app/agent/tools/`.
 
+**Requirement: every approved action ends with a known, saved result.**
+Today the run timeout works by cancelling the run. That can't stop a
+synchronous tool in its worker thread, and it stops an async tool at an
+arbitrary point; either way LangGraph saves a step's results only when the
+whole step finishes. Reproduced on 2026-11-05 with a slow approved tool and
+a 0.2s timeout: resume returned `504`, the side effect happened half a
+second later, no result was saved, and a second resume found nothing to
+approve. Before these tools land:
+
+- The run deadline stops the loop between steps instead of cancelling one in
+  progress: past the deadline, `react` ends the run with a time-limit
+  message, the way it handles the step limit. Each step stays bounded on its
+  own: model calls by `llm_timeout` and its retries, tools by their own
+  timeouts. Keep a much larger outer `asyncio.timeout` only as a backstop.
+- Every side-effecting tool has a timeout that actually stops the work:
+  commands get the sandbox's wall-clock limit, which kills the container
+  (5b); writes are short and atomic (write a temporary file, then rename).
+- Make writes safe to repeat where possible: `write_file` writes the whole
+  content, and `apply_patch` checks that the file still matches the diff's
+  base before applying it. Commands can't be made safe to repeat, which is
+  why their outcome has to be known.
+- If a result is lost anyway (the backstop fired, or the process died), the
+  model gets the placeholder from step 4, which says the call may or may not
+  have run.
+
 **Tests**
 
 - Unit tests per tool in a `tmp_path` workspace.
@@ -498,6 +523,8 @@ the accepted risk under Order.
   in the sandbox (approved) → final answer. Run it against the fake sandbox
   backend by default.
 - Rejecting the write leaves the file unchanged.
+- A run that passes its deadline while an approved tool runs still saves the
+  tool's result, and the next turn shows it.
 
 **Done when:** the scripted run passes, and neither tool can act without
 approval.
