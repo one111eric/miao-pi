@@ -41,9 +41,10 @@ Fix formatting with `uv run isort . && uv run black .`.
   `gate.py` (`require_dev_ui`, which hides developer-only routes).
 - `app/agent/` — the LangGraph workflow: `state.py` (graph state),
   `nodes.py` (async node functions), `graph.py` (wiring and compile),
-  `service.py` (runs the graph for a request), `workspace.py` (the
+  `service.py` (runs or resumes the graph for a request), `approval.py`
+  (pausing for a human before tools with side effects), `workspace.py` (the
   boundary for project files), and `tools/` (the read-only tools, one module
-  each, plus shared `files.py` and `output.py`).
+  each, plus `tool_utils/` with the shared `files.py` and `output.py`).
 - `common/` — code shared across features: `config.py` (`SvcSettings`),
   `llm/` (`LLM`, a `ChatOpenAI` subclass), `logging_helper.py`.
 - `tests/unit/` — no network, no app lifespan.
@@ -53,7 +54,9 @@ Fix formatting with `uv run isort . && uv run black .`.
 ## Architecture
 
 Request flow: `POST /invoke` → `app/agent/router.py` → `invoke_agent()` →
-compiled graph `preplanning → react ⇄ tools → finalize`.
+compiled graph `preplanning → react ⇄ [approve →] tools → finalize`.
+`POST /threads/{thread_id}/resume` → `resume_agent()` continues a run paused
+in `approve`.
 
 - `preplanning` reloads `AGENTS.md` (falling back to `README.md`) from the
   workspace on every turn, with a configured size cap.
@@ -61,10 +64,47 @@ compiled graph `preplanning → react ⇄ tools → finalize`.
   through `make_react(llm, tools)`, binding the tools there. It builds a
   system message from `SYSTEM_PROMPT`, the tool names, and the current
   workspace context at call time; none of it is stored in message history.
-- `tools` is LangGraph's `ToolNode`, reached through `tools_condition` and
-  looping back to `react` until the model answers without a tool call.
-  `log_tool_call` wraps every call. Without tools, `react` goes straight to
-  `finalize`.
+- `tools` is LangGraph's `ToolNode`, reached through
+  `make_route_after_react` and looping back to `react` until the model
+  answers without a tool call. Each call goes through `log_tool_call`, then
+  the approval gate. Without tools, `react` goes straight to `finalize`.
+
+Approval (`app/agent/approval.py`):
+
+- A tool opts in with `metadata={REQUIRES_APPROVAL: True}`; none of the read
+  tools do. If any call in a model response needs approval, the route goes
+  to `approve` instead of `tools`.
+- `approve` calls LangGraph's `interrupt` once, listing every
+  approval-requiring call in that response, and the run pauses in the
+  checkpoint. `invoke_agent` sees `__interrupt__` and returns
+  `awaiting_approval` with the actions. One decision covers them all.
+- On resume (`Command(resume=decision)`), `approve` runs again from the top;
+  `interrupt` then returns the decision instead of pausing, and `approve`
+  records it in `state["approvals"]` by tool call id. Keep `approve` free of
+  side effects before `interrupt`, since it always runs twice.
+- The gate in front of every tool call refuses an approval-requiring call
+  unless its recorded decision approved it, returning an error
+  `ToolMessage` (`rejection_text`), so a routing bug fails closed. Rejected
+  calls reach the model as that error result; other calls in the same
+  response run normally.
+- The interrupt lives in its own node rather than inside each tool: on
+  resume LangGraph reruns the whole interrupted node, and `ToolNode` would
+  rerun every call in it.
+- A new `/invoke` on a waiting thread gets `409` (`ThreadAwaitingApprovalError`),
+  because a fresh run would silently drop the pending one. Resume returns
+  `404` for an unknown thread and `409` when nothing waits. Resume holds
+  the thread with `ThreadStore.use_existing()`, which raises
+  `ThreadNotFoundError` without tracking the id: with `use()`, an unknown id
+  would count toward `max_threads` and its cleanup could evict a real
+  thread.
+- `react` gives any tool call that arrives without an id one
+  (`call_<hex>`), because approval, the gate, and tool results all match
+  calls by id. If a run still pauses with no actions, `invoke_agent` raises
+  rather than report it as completed.
+- An approval round needs no extra step budget: the run pauses in `approve`,
+  and each resume gets a fresh step budget.
+- Decisions are logged as `Approval decision received` (approved, tool
+  names), never with arguments.
 - `finalize` is a placeholder for post-processing.
 
 Tools (`app/agent/tools/`):
@@ -73,14 +113,15 @@ Tools (`app/agent/tools/`):
   shaped after pi's coding agent: same names, parameters, caps (2000 lines or
   50KB, 500 entries, 1000 results, 100 matches), and actionable truncation
   notices. Results are relative to the workspace root.
-- Every path goes through `Workspace`. `files.resolve_for_tool` and
-  `files.open_for_tool` turn workspace and OS errors into `ToolException`s;
-  each tool sets `handle_tool_error=True`, so they reach the model as error
-  results. Only bugs propagate. Never put an absolute server path in a tool
-  result.
-- `find` and `grep` walk the tree in Python (`files.iter_files`) instead of
-  running `fd`/`rg`, so the deny list and `.gitignore` (via `pathspec`)
-  apply exactly. Denied and escaping entries are hidden, not reported.
+- Every path goes through `Workspace`. `tool_utils.files.resolve_for_tool`
+  and `tool_utils.files.open_for_tool` turn workspace and OS errors into
+  `ToolException`s; each tool sets `handle_tool_error=True`, so they reach
+  the model as error results. Only bugs propagate. Never put an absolute
+  server path in a tool result.
+- `find` and `grep` walk the tree in Python (`tool_utils.files.iter_files`)
+  instead of running `fd`/`rg`, so the deny list and `.gitignore` (via
+  `pathspec`) apply exactly. Denied and escaping entries are hidden, not
+  reported.
 - `Workspace.open_file` is the only way to read file contents. It walks
   from the root one component at a time, each opened relative to its parent
   (`dir_fd`) with `O_NOFOLLOW`, so a symlink swapped in anywhere along the
@@ -119,7 +160,9 @@ State and memory:
   `invoke_agent` generates one when the request has none, and always returns
   it.
 - `ThreadStore` (`app/agent/threads.py`) owns the `InMemorySaver` and its
-  retention. Wrap every run in `async with threads.use(thread_id):`.
+  retention. Wrap every run in `async with threads.use(thread_id):`, or
+  `threads.use_existing(thread_id)` for a request that can only continue a
+  thread (it never tracks an unknown id).
   - One run per thread at a time: a second `use()` on a busy thread raises
     `ThreadBusyError`, which `/invoke` returns as `409`.
   - Idle threads unused for `thread_ttl` seconds are deleted when a run
@@ -241,9 +284,13 @@ change its shape.
 - Unit-test tools by invoking them with a tool-call dict, the way `ToolNode`
   does, so errors come back as `ToolMessage(status="error")` (see `call` in
   `tests/unit/test_read_tools.py`).
-- `serve(model, root)` in `tests/apps.py` runs the app with its lifespan, a
-  given model, and a workspace, when the `client` fixture's `EchoChatModel`
-  won't do. `GatedChatModel` in `tests/fakes.py` holds every call until
+- `serve(model, root, extra_tools)` in `tests/apps.py` runs the app with its
+  lifespan, a given model, and a workspace, when the `client` fixture's
+  `EchoChatModel` won't do. `recording_tool(effects)` in `tests/fakes.py` is
+  a tool that needs approval and records what it did.
+- A graph swapped into `app.state.agent_graph` needs
+  `checkpointer=app.state.thread_store.checkpointer`, like the real one:
+  `invoke_agent` reads saved state to check for a pending approval. `GatedChatModel` in `tests/fakes.py` holds every call until
   `release` is set, to test behavior while a run is in progress.
 - Tests that need the test UI set `app.state.dev_ui_enabled` explicitly, so a
   developer's `.env` can't change the result. The page's JavaScript has no
@@ -264,7 +311,14 @@ change its shape.
 - Conversation memory lives in the server process: it's lost on restart and
   isn't shared between workers, so run a single worker until step 8.
 - Any caller can continue any `thread_id` they know. There's no ownership
-  check until authentication lands (step 5a).
+  check until authentication lands (step 7b, before anything is reachable
+  beyond the user's machine).
+- The service is meant to run only on the user's machine, bound to
+  `127.0.0.1`. Never start it with `--host 0.0.0.0`. Even so, it accepts any
+  `Host` header, so a web page open in the user's browser can reach it
+  through DNS rebinding. That's an accepted risk until authentication lands
+  in step 7b, including once step 6 adds write and command tools (see
+  `docs/next-steps.md`).
 - The configured workspace root must exist and be a directory. Context files
   are optional; without either `AGENTS.md` or `README.md`, the base system
   prompt is used.
@@ -272,15 +326,20 @@ change its shape.
   explicitly in deployment before file-writing tools are enabled, or the
   service may be able to edit its own checkout. The `Startup complete` log
   shows the resolved root and the deny patterns in effect.
+- The run timeout cancels the run, which can't stop a synchronous tool in
+  its worker thread: the call can finish after the `504` with no result
+  saved. The next turn's placeholder therefore says the call may or may not
+  have run. Step 6 must replace this with a deadline that stops between
+  steps, before any side-effecting tool lands (see `docs/next-steps.md`).
 - `grep` uses Python's `re`, which has no timeout: a pathological pattern can
   keep a worker thread busy after the run deadline cancels the request.
   Tools run in threads, and threads can't be cancelled.
 - Project files reach the model as tool results, and the model treats them
   as input. A malicious repository can try to steer the agent through them;
-  approval (step 5b) is the safeguard before any tool has side effects.
+  approval (step 5a) is the safeguard before any tool has side effects.
 - With `dev_ui_enabled`, anyone who can reach the server can read any
   thread's history, tool results included. Keep it off outside local
-  development until 5a adds authentication and ownership checks.
+  development until 7b adds authentication and ownership checks.
 
 ## Rules
 

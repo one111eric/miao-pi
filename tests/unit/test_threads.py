@@ -5,7 +5,7 @@ from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from app.agent.graph import AgentGraph, build_agent_graph
-from app.agent.threads import ThreadBusyError, ThreadStore
+from app.agent.threads import ThreadBusyError, ThreadNotFoundError, ThreadStore
 from tests.fakes import EchoChatModel
 
 
@@ -75,6 +75,35 @@ async def test_least_recently_used_threads_go_first_beyond_the_cap(
     assert await has_checkpoint(store, "a")
     assert not await has_checkpoint(store, "b")
     assert await has_checkpoint(store, "c")
+
+
+@pytest.mark.anyio
+async def test_use_existing_never_tracks_an_unknown_thread(clock: FakeClock) -> None:
+    store = make_store(clock, max_threads=1)
+    graph = build_agent_graph(EchoChatModel(), checkpointer=store.checkpointer)
+    await run(store, graph, "real")
+
+    with pytest.raises(ThreadNotFoundError):
+        async with store.use_existing("fake"):
+            pass
+
+    # Tracking "fake" would have put the store over its cap, and the cleanup
+    # would have evicted "real".
+    assert await has_checkpoint(store, "real")
+    async with store.use_existing("real"):
+        pass
+
+
+@pytest.mark.anyio
+async def test_use_existing_treats_an_expired_thread_as_gone(clock: FakeClock) -> None:
+    store = make_store(clock)
+    graph = build_agent_graph(EchoChatModel(), checkpointer=store.checkpointer)
+    await run(store, graph, "a")
+    clock.now = 3601
+
+    with pytest.raises(ThreadNotFoundError):
+        async with store.use_existing("a"):
+            pass
 
 
 @pytest.mark.anyio

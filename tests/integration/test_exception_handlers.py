@@ -54,7 +54,9 @@ async def test_provider_timeout_returns_504(
     app: FastAPI,
     client: AsyncClient,
 ) -> None:
-    app.state.agent_graph = build_agent_graph(TimeoutChatModel())
+    app.state.agent_graph = build_agent_graph(
+        TimeoutChatModel(), checkpointer=app.state.thread_store.checkpointer
+    )
 
     response = await client.post("/invoke", json={"message": "Hello"})
 
@@ -67,7 +69,9 @@ async def test_provider_error_returns_502_without_details(
     app: FastAPI,
     client: AsyncClient,
 ) -> None:
-    app.state.agent_graph = build_agent_graph(FailingChatModel())
+    app.state.agent_graph = build_agent_graph(
+        FailingChatModel(), checkpointer=app.state.thread_store.checkpointer
+    )
 
     response = await client.post("/invoke", json={"message": "Hello"})
 
@@ -82,7 +86,9 @@ async def test_failed_model_call_is_logged_with_its_thread_and_duration(
     client: AsyncClient,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    app.state.agent_graph = build_agent_graph(FailingChatModel())
+    app.state.agent_graph = build_agent_graph(
+        FailingChatModel(), checkpointer=app.state.thread_store.checkpointer
+    )
 
     original_formatter = caplog.handler.formatter
     caplog.handler.setFormatter(RequestFormatter("%(context)s%(message)s"))

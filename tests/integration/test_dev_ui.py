@@ -125,6 +125,7 @@ async def test_history_shows_tool_calls_and_their_results(tmp_path: Path) -> Non
             ),
             message("ai", "It says 42."),
         ],
+        "pending_actions": [],
     }
 
 

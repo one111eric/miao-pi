@@ -26,7 +26,7 @@ without `curl`.
   content sites with a few interactive parts, and this page is interactive
   throughout. See "Hosting later" for what hosting actually needs.
 - Off by default, behind a `dev_ui_enabled` setting. There's no
-  authentication until 5a, and the page shows file contents the tools read.
+  authentication until 7b, and the page shows file contents the tools read.
 - `/invoke` stays as it is. The page gets tool activity from a separate,
   read-only history endpoint, which step 7's stream can replace later.
 
@@ -119,10 +119,10 @@ real model.
 **Hosting later** (for example on Cloudflare Pages): the static files deploy
 as they are. The API they call is the hard part, and needs:
 
-- Authentication (5a). A hosted page means a publicly reachable API, and
+- Authentication (7b). A hosted page means a publicly reachable API, and
   without a token anyone could read the workspace through the agent.
 - An HTTPS deployment of the API (step 8). It can't run on Cloudflare
-  Workers: it needs a real file system and, from 5c, containers. Cloudflare
+  Workers: it needs a real file system and, from 5b, containers. Cloudflare
   Tunnel is one way to expose it.
 - A setting listing the page origins allowed by CORS on the agent routes.
   Never `*`.
@@ -136,5 +136,8 @@ If the page grows into a product UI, with several views, login, or markdown
 and code rendering, choose a framework then, as its own package with its own
 CI.
 
-**Notes:** steps 5a, 5b, and 7 in [next-steps.md](next-steps.md) each
-extend the page; their sections say how.
+**Notes:** steps 5a, 7, and 7b in [next-steps.md](next-steps.md) each
+extend the page; their sections say how. 5a's part is done: a paused run
+shows its pending actions with an optional note and Approve and Reject
+buttons, Send is disabled until you decide, and the history endpoint's
+`pending_actions` brings the card back after a reload.

@@ -81,7 +81,9 @@ async def test_unhandled_error_keeps_the_request_id(
     client: AsyncClient,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    app.state.agent_graph = build_agent_graph(BrokenChatModel())
+    app.state.agent_graph = build_agent_graph(
+        BrokenChatModel(), checkpointer=app.state.thread_store.checkpointer
+    )
 
     original_formatter = caplog.handler.formatter
     caplog.handler.setFormatter(RequestFormatter("%(context)s%(message)s"))
@@ -109,7 +111,9 @@ async def test_each_request_logs_its_completion(
     client: AsyncClient,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    app.state.agent_graph = build_agent_graph(BrokenChatModel())
+    app.state.agent_graph = build_agent_graph(
+        BrokenChatModel(), checkpointer=app.state.thread_store.checkpointer
+    )
 
     with caplog.at_level(logging.INFO, logger="app.service.middlewares"):
         await client.get("/health?token=not-for-logs")

@@ -22,6 +22,10 @@ uv run uvicorn app.service.server:app --reload --port 9091
 The health endpoint is available at <http://127.0.0.1:9091/health>, and the
 OpenAPI documentation is at <http://127.0.0.1:9091/api/v1/docs>.
 
+The service has no authentication yet and is meant to run only on your own
+machine: keep it bound to `127.0.0.1` (uvicorn's default), and don't pass
+`--host 0.0.0.0`.
+
 Invoke the agent:
 
 ```bash
@@ -99,6 +103,37 @@ AGENT_RUN_TIMEOUT=300
 out, the agent stops and says so, and asking it to continue resumes with a
 fresh budget. A run that exceeds `AGENT_RUN_TIMEOUT` seconds returns
 `504 Gateway Timeout`.
+
+## Approvals
+
+Tools that change things pause the run until you approve or reject them.
+None of the four tools above do; the write and command tools planned next
+will. When the agent asks for one, `/invoke` returns:
+
+```json
+{
+  "status": "awaiting_approval",
+  "response": null,
+  "thread_id": "...",
+  "actions": [{"tool_call_id": "...", "tool": "...", "args": {}}]
+}
+```
+
+Decide with one call, which covers every listed action and continues the
+run:
+
+```bash
+curl -X POST http://127.0.0.1:9091/threads/<thread_id>/resume \
+  -H 'Content-Type: application/json' \
+  -d '{"approved": false, "note": "Use a smaller change."}'
+```
+
+A rejection reaches the model as the tool's result, note included, so it can
+change its plan. The response has the same shape as `/invoke`: `completed`
+with the reply, or `awaiting_approval` again. While a thread waits, a new
+message to it returns `409`; a resume for a thread with nothing pending also
+returns `409`. A waiting thread still expires after `THREAD_TTL`. The test
+page shows pending actions with Approve and Reject buttons.
 
 ## Test UI
 

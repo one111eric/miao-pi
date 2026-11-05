@@ -10,8 +10,10 @@ from langchain_core.language_models import BaseChatModel, LanguageModelInput
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import Runnable
-from langchain_core.tools import BaseTool
+from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import Field
+
+from app.agent.approval import REQUIRES_APPROVAL
 
 # Mirrors BaseChatModel.bind_tools, whose signature uses Any.
 type BindableTool = dict[str, Any] | type | Callable[..., Any] | BaseTool
@@ -134,4 +136,19 @@ def tool_call(name: str, call_id: str, **args: object) -> AIMessage:
     return AIMessage(
         content="",
         tool_calls=[{"name": name, "args": args, "id": call_id, "type": "tool_call"}],
+    )
+
+
+def recording_tool(effects: list[str]) -> BaseTool:
+    """A tool with a side effect, for approval tests: it appends to ``effects``."""
+
+    def record(text: str) -> str:
+        effects.append(text)
+        return f"Recorded {text}"
+
+    return StructuredTool.from_function(
+        func=record,
+        name="record",
+        description="Record a note. This changes state, so it needs approval.",
+        metadata={REQUIRES_APPROVAL: True},
     )

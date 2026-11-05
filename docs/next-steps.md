@@ -16,6 +16,10 @@ langchain-openai 1.7.2, and fastapi 0.149.0.
   limit and a run timeout (step 4).
 - With `DEV_UI_ENABLED=true`, a test page at `/ui/` shows each turn's reply
   and tool calls, backed by `GET /threads/{thread_id}/messages` (step 4b).
+- Tools marked as needing approval pause the run; `/invoke` returns
+  `awaiting_approval` with the actions, and
+  `POST /threads/{thread_id}/resume` approves or rejects them (step 5a). No
+  shipped tool needs it yet.
 - Conversations continue across requests that share a `thread_id`, kept in
   an in-memory checkpointer with a TTL and a thread cap (step 2).
 - A validated workspace boundary rejects escapes and denied paths; project
@@ -35,11 +39,11 @@ langchain-openai 1.7.2, and fastapi 0.149.0.
 3.  Workspace boundary + project context
 4.  ReAct loop + read-only tools
 4b. Test UI (a developer page for trying the agent)
-5a. Authentication + thread ownership
-5b. Approval (interrupt + resume API)
-5c. Command sandbox
+5a. Approval (interrupt + resume API)
+5b. Command sandbox
 6.  Write and command tools
 7.  Streaming
+7b. Authentication + thread ownership
 8.  Persistent checkpointer and deployment
 ```
 
@@ -49,11 +53,24 @@ protect:
 - Timeouts and error mapping (1) exist before the loop (4) can make many
   paid calls.
 - The workspace boundary (3) exists before any tool touches the file system.
-- Authentication, approval, and the sandbox (5a–5c) all exist before the
-  agent can write files or run commands (6).
+- Approval and the sandbox (5a, 5b) exist before the agent can write files
+  or run commands (6).
+- Authentication (7b) exists before the service, or a hosted UI, can be
+  reached from anywhere but the user's own machine (8).
 
-**Gate on step 6:** don't merge write or command tools until 5a, 5b, and 5c
-have all landed. An executable allowlist alone isn't a security boundary:
+**Accepted risk until 7b:** authentication waits because, until step 8, the
+service runs only on the user's own machine, bound to `127.0.0.1`. That
+isn't fully private: the server accepts any `Host` header, so through DNS
+rebinding a web page open in the user's browser can reach the API (checked
+on 2026-11-04: a request with `Host: evil.example` got `200`). Today that
+page could have the agent read workspace files. From 5a it could also
+approve its own pending action, and from step 6 it could have the agent
+write files and run commands. If that becomes unacceptable before 7b,
+Starlette's `TrustedHostMiddleware`, allowing only `localhost`, `127.0.0.1`,
+and `[::1]`, closes most of the gap in one line.
+
+**Gate on step 6:** don't merge write or command tools until 5a and 5b have
+both landed. An executable allowlist alone isn't a security boundary:
 `pytest` runs `conftest.py`, `git` runs hooks, `npm` runs scripts, and
 `python` runs anything. Combined with `write_file`, the agent can write a
 file and then execute it.
@@ -195,7 +212,7 @@ without memory growing forever.
   step 8 fixes that.
 - Thread ownership (stopping one caller from using another's `thread_id`)
   only means something once there are authenticated callers, so it lands in
-  5a. Until then, generated ids are unguessable `uuid4`s, but a client can
+  7b. Until then, generated ids are unguessable `uuid4`s, but a client can
   still supply any id it likes.
 
 ---
@@ -308,8 +325,8 @@ Where miao-pi differs from pi, and why:
 **Changes**
 
 - `app/agent/tools/`: `make_read_tools(workspace)`; one module per tool,
-  plus `files.py` (path checks, error mapping, the walker) and `output.py`
-  (caps and notices).
+  plus `tool_utils/files.py` (path checks, error mapping, the walker) and
+  `tool_utils/output.py` (caps and notices).
 - `Workspace.open_file`: checks that the root is still the directory found
   at startup (device and inode), opens each path component relative to its
   parent with `O_NOFOLLOW`, then the file with `O_NONBLOCK`, and accepts only
@@ -343,7 +360,7 @@ and a timeout followed by a recovered turn.
   Document which models are known to work.
 - `re` has no timeout, so a pathological `grep` pattern can keep a worker
   thread busy after the deadline. If that matters, switch to `google-re2`
-  or run `grep` in the step 5c sandbox.
+  or run `grep` in the step 5b sandbox.
 
 ---
 
@@ -357,38 +374,21 @@ and results it made. The plan is in [test-ui.md](test-ui.md).
 
 ---
 
-## 5a. Authentication and thread ownership
+## 5a. Approval: interrupt and resume
 
-**Goal:** only known callers can use the agent, and each caller can only
-reach their own threads.
+**Status: done (2026-11-04).** Two changes from the plan below:
 
-**Changes**
+- The `interrupt` lives in its own `approve` node, between `react` and
+  `tools`, not inside each tool. On resume LangGraph reruns the whole
+  interrupted node, and `ToolNode` would rerun every call in it. A gate in
+  front of each tool call also refuses an approval-requiring call without an
+  approved decision, so a routing mistake fails closed.
+- A paused run returns `actions` (a list): one model response can ask for
+  several tools at once, and one decision covers them all. Diffs come with
+  the write tools in step 6.
 
-- A bearer-token check as a FastAPI dependency on the agent routes (not
-  `/health`).
-  - Start with one token, or a small set, in a `SecretStr` setting.
-  - Compare with `secrets.compare_digest`.
-  - Refuse to start if no token is configured, unless an explicit
-    `auth_disabled` setting is set for local development.
-- Each token maps to a caller id. Record which caller created each thread
-  (next to the retention tracking from step 2). A request for a thread owned
-  by a different caller gets `404`, not `403`, so it doesn't reveal that the
-  thread exists.
-- Add the caller id to the logging context.
-- The 4b history endpoint gets the same token check and ownership rule as
-  `/invoke`. The test page gains a token field, keeps the token in
-  `sessionStorage`, and sends it with every request.
-
-**Tests:** missing or wrong token → `401`; `/health` stays open; caller B
-can't continue or read caller A's thread; with auth disabled, requests work
-without a token.
-
-**Done when:** the agent routes require a token, and cross-caller access is
-blocked.
-
----
-
-## 5b. Approval: interrupt and resume
+`/invoke` on a waiting thread returns `409`, because a new run would
+silently drop the pending one.
 
 **Goal:** the agent pauses before any action with side effects, and a human
 approves or rejects it.
@@ -417,15 +417,17 @@ approves or rejects it.
 
 **Tests:** scripted run → pending action returned → approve → the tool runs
 and the run finishes; reject → the tool doesn't run, and the model sees the
-rejection; resuming a thread with nothing pending → `409`; ownership from 5a
-applies to resume.
+rejection; resuming a thread with nothing pending → `409`.
+
+**Note:** until 7b, anything that can reach the API can approve an action as
+easily as request one (see the accepted risk under Order).
 
 **Done when:** a side-effecting test tool can't run without an approval
 through the API.
 
 ---
 
-## 5c. Command sandbox
+## 5b. Command sandbox
 
 **Goal:** commands the agent runs can't reach beyond the workspace, even if
 the command itself is malicious.
@@ -470,14 +472,15 @@ decisions above are written down in `AGENTS.md`.
 
 **Goal:** the agent can change code and run commands, safely.
 
-**Gate:** 5a, 5b, and 5c have all landed.
+**Gate:** 5a and 5b have both landed. Authentication (7b) comes later; see
+the accepted risk under Order.
 
 **Tools**
 
 1. `write_file(path, content)` and/or `apply_patch(diff)`, through
-   `Workspace`. Every write requires approval (5b), showing the diff.
-2. `run_command(argv)`, executed only through the sandbox (5c), never on the
-   host. Every command requires approval (5b), showing the exact argv. A
+   `Workspace`. Every write requires approval (5a), showing the diff.
+2. `run_command(argv)`, executed only through the sandbox (5b), never on the
+   host. Every command requires approval (5a), showing the exact argv. A
    short allowlist can stay as a convenience filter, but it's not the
    security boundary.
 
@@ -488,6 +491,31 @@ decisions above are written down in `AGENTS.md`.
 - Command output is truncated and capped like the read tools.
 - Combine with the read tools into `TOOLS` in `app/agent/tools/`.
 
+**Requirement: every approved action ends with a known, saved result.**
+Today the run timeout works by cancelling the run. That can't stop a
+synchronous tool in its worker thread, and it stops an async tool at an
+arbitrary point; either way LangGraph saves a step's results only when the
+whole step finishes. Reproduced on 2026-11-05 with a slow approved tool and
+a 0.2s timeout: resume returned `504`, the side effect happened half a
+second later, no result was saved, and a second resume found nothing to
+approve. Before these tools land:
+
+- The run deadline stops the loop between steps instead of cancelling one in
+  progress: past the deadline, `react` ends the run with a time-limit
+  message, the way it handles the step limit. Each step stays bounded on its
+  own: model calls by `llm_timeout` and its retries, tools by their own
+  timeouts. Keep a much larger outer `asyncio.timeout` only as a backstop.
+- Every side-effecting tool has a timeout that actually stops the work:
+  commands get the sandbox's wall-clock limit, which kills the container
+  (5b); writes are short and atomic (write a temporary file, then rename).
+- Make writes safe to repeat where possible: `write_file` writes the whole
+  content, and `apply_patch` checks that the file still matches the diff's
+  base before applying it. Commands can't be made safe to repeat, which is
+  why their outcome has to be known.
+- If a result is lost anyway (the backstop fired, or the process died), the
+  model gets the placeholder from step 4, which says the call may or may not
+  have run.
+
 **Tests**
 
 - Unit tests per tool in a `tmp_path` workspace.
@@ -495,6 +523,8 @@ decisions above are written down in `AGENTS.md`.
   in the sandbox (approved) → final answer. Run it against the fake sandbox
   backend by default.
 - Rejecting the write leaves the file unchanged.
+- A run that passes its deadline while an approved tool runs still saves the
+  tool's result, and the next turn shows it.
 
 **Done when:** the scripted run passes, and neither tool can act without
 approval.
@@ -508,9 +538,9 @@ happen.
 
 **Changes**
 
-- `POST /stream` in `app/agent/router.py`, with the same request model and
-  auth as `/invoke`, returning `fastapi.sse.EventSourceResponse` (available
-  in the installed FastAPI).
+- `POST /stream` in `app/agent/router.py`, with the same request model as
+  `/invoke` (and 7b's token check, once it lands), returning
+  `fastapi.sse.EventSourceResponse` (available in the installed FastAPI).
 - Drive it with `graph.astream(..., stream_mode=["messages", "updates"])`.
   It's simpler to map than `astream_events`; switch only if finer events are
   needed.
@@ -518,10 +548,10 @@ happen.
   - `token`
   - `tool_call`
   - `tool_result`
-  - `awaiting_approval`, with the same payload as 5b
+  - `awaiting_approval`, with the same payload as 5a
   - `done`, with the `thread_id`
   - `error`
-- After an approval, the client uses the 5b resume endpoint; add a streaming
+- After an approval, the client uses the 5a resume endpoint; add a streaming
   variant of resume if needed.
 - Errors after the stream has started must go out as an `error` event, not
   an HTTP status.
@@ -538,10 +568,54 @@ the approval pause.
 
 ---
 
+## 7b. Authentication and thread ownership
+
+**Goal:** only known callers can use the agent, and each caller can only
+reach their own threads.
+
+**When:** before the service, or a hosted UI, can be reached from anywhere
+but the user's own machine: step 8's deployment, a shared server, or the
+hosting described in [test-ui.md](test-ui.md). It used to come right after
+the test UI; it moved here on 2026-11-04 because a service that runs only on
+the user's computer gains little from it. The risk that leaves open is described under Order.
+
+**Changes**
+
+- A bearer-token check as a FastAPI dependency on the agent routes (not
+  `/health`).
+  - Start with one token, or a small set, in a `SecretStr` setting.
+  - Compare with `secrets.compare_digest`.
+  - Refuse to start if no token is configured, unless an explicit
+    `auth_disabled` setting is set for local development.
+- Each token maps to a caller id. Record which caller created each thread
+  (next to the retention tracking from step 2). A request for a thread owned
+  by a different caller gets `404`, not `403`, so it doesn't reveal that the
+  thread exists.
+- Add the caller id to the logging context.
+- Streaming (7) and the 5a resume endpoint get the same token check as
+  `/invoke`.
+- Add a `Host` allowlist (`TrustedHostMiddleware`) at the same time: it
+  blocks DNS rebinding, and a deployment needs it anyway.
+- The 4b history endpoint gets the same token check and ownership rule as
+  `/invoke`. The test page gains a token field, keeps the token in
+  `sessionStorage`, and sends it with every request.
+
+**Tests:** missing or wrong token → `401`; `/health` stays open; caller B
+can't continue or read caller A's thread; with auth disabled, requests work
+without a token.
+
+**Done when:** the agent routes require a token, and cross-caller access is
+blocked.
+
+---
+
 ## 8. Persistent checkpointer and deployment
 
 **Goal:** threads survive restarts, and the service can run beyond a
 developer laptop.
+
+**Gate:** 7b has landed. Nothing is reachable beyond the user's machine
+without authentication.
 
 - Replace `InMemorySaver` with a persistent checkpointer: SQLite for a single
   instance, Postgres for several workers. Move thread ownership and retention
@@ -550,7 +624,7 @@ developer laptop.
 - Stop saving project context with every checkpoint. `context` lives in the
   graph state, so each turn stores another copy of up to
   `workspace_context_max_chars`. Load it inside `react` instead. Don't use
-  `UntrackedValue`: a run resumed after a 5b approval continues at `react`
+  `UntrackedValue`: a run resumed after a 5a approval continues at `react`
   without rerunning `preplanning`, so it would have no context.
 - A Dockerfile for the service itself, separate from the command sandbox
   image.
@@ -567,4 +641,4 @@ Not planned yet; revisit after step 6.
 - An eval set: a handful of real coding tasks against fixture repos, run on
   demand like the live LLM tests.
 - Tracing (for example LangSmith) behind an opt-in setting.
-- Per-request workspaces, building on 5a and 5c.
+- Per-request workspaces, building on 7b and 5b.
