@@ -4,6 +4,7 @@ import re
 import shutil
 import signal
 import sys
+import threading
 import time
 from collections.abc import Sequence
 from pathlib import Path
@@ -13,6 +14,7 @@ import pytest
 from app.agent.sandbox import (
     CommandResult,
     CommandSettings,
+    ContainmentError,
     RunDir,
     Sandbox,
     SandboxConfigError,
@@ -248,35 +250,54 @@ def test_the_sweep_ends_only_this_runs_processes(
     processes.add(12, sandboxed=False, reads={marker, canary}, pgid=12)
     processes.add(13, sandboxed=True, reads={other_marker}, pgid=13)  # other run
     processes.add(14, sandboxed=True, reads={marker, canary}, pgid=14)  # other app
-    processes.add(15, sandboxed=True, reads={marker}, pgid=15)  # setuid, say
-    processes.unkillable = {15}
 
     seatbelt_sweep.end_run_processes(run_dir, pgid=100)
 
     assert sorted(processes.killed) == [10, 11]
-    assert sorted(processes.table) == [12, 13, 14, 15]
+    assert sorted(processes.table) == [12, 13, 14]
     messages = {record.getMessage(): record for record in caplog.records}
     escaped = messages["Ended processes that left the command's process group"]
-    assert getattr(escaped, "count") == 2
-    assert "A command left processes running that can't be signalled" in messages
-    assert "A command's processes outlasted the sweep" not in messages
+    assert getattr(escaped, "count") == 1  # 10 was still in the group
 
 
-def test_the_sweep_gives_up_on_a_fork_loop_and_says_so(
-    tmp_path: Path,
-    processes: FakeProcesses,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
+def test_the_sweep_fails_when_a_process_cant_be_signalled(
+    tmp_path: Path, processes: FakeProcesses
+) -> None:
+    marker = os.fsencode(tmp_path / "marker")
+    processes.add(10, sandboxed=True, reads={marker}, pgid=10)
+    processes.add(11, sandboxed=True, reads={marker}, pgid=11)  # setuid, say
+    processes.unkillable = {11}
+
+    with pytest.raises(ContainmentError, match="1 can't be signalled"):
+        seatbelt_sweep.end_run_processes(tmp_path, pgid=10)
+
+    assert processes.killed == [10]
+
+
+def test_the_sweep_fails_when_a_fork_loop_outlasts_it(
+    tmp_path: Path, processes: FakeProcesses, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(seatbelt_sweep, "MAX_PASSES", 3)
     marker = os.fsencode(tmp_path / "marker")
     processes.add(10, sandboxed=True, reads={marker}, pgid=10)
     processes.respawn = True
 
-    seatbelt_sweep.end_run_processes(tmp_path, pgid=10)
+    with pytest.raises(ContainmentError, match="1 outlasted 3 passes"):
+        seatbelt_sweep.end_run_processes(tmp_path, pgid=10)
 
     assert len(processes.killed) == 3
-    assert "A command's processes outlasted the sweep" in caplog.text
+
+
+def test_a_sweep_that_ends_everything_on_its_last_pass_succeeds(
+    tmp_path: Path, processes: FakeProcesses, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(seatbelt_sweep, "MAX_PASSES", 1)
+    marker = os.fsencode(tmp_path / "marker")
+    processes.add(10, sandboxed=True, reads={marker}, pgid=10)
+
+    seatbelt_sweep.end_run_processes(tmp_path, pgid=10)
+
+    assert processes.killed == [10]
 
 
 # Bubblewrap
@@ -481,6 +502,146 @@ async def test_cancelling_the_caller_sweeps_too(root: Path) -> None:
     with pytest.raises(asyncio.CancelledError):
         await run
     assert [existed for existed, _ in sandbox.sweeps] == [True]
+
+
+UNSIGNALLABLE = "the command left processes running: 1 can't be signalled"
+
+
+class FailingSweep(UnconfinedSandbox):
+    """A sweep that raises ``error``, optionally after a pause."""
+
+    def __init__(
+        self, policy: SandboxPolicy, error: Exception | None, pause: float = 0
+    ) -> None:
+        super().__init__(policy)
+        self.error = error
+        self.pause = pause
+        self.started = threading.Event()
+        self.threads: list[int] = []
+        # Whether the run directory still existed when each sweep finished.
+        self.finished: list[bool] = []
+
+    def sweep(self, run: RunDir, pgid: int) -> None:
+        self.threads.append(threading.get_ident())
+        self.started.set()
+        time.sleep(self.pause)
+        self.finished.append(run.path.is_dir())
+        if self.error is not None:
+            raise self.error
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(ContainmentError(UNSIGNALLABLE), id="processes-left"),
+        pytest.param(OSError("proc_listallpids failed"), id="sweep-crashed"),
+    ],
+)
+async def test_a_failed_sweep_fails_the_command_and_turns_commands_off(
+    root: Path, error: Exception, caplog: pytest.LogCaptureFixture
+) -> None:
+    sandbox = FailingSweep(SandboxPolicy(Workspace(root)), error)
+
+    with pytest.raises(ContainmentError):
+        await sandbox.run(["true"], cwd=root)
+    with pytest.raises(ContainmentError, match="until the service restarts"):
+        await sandbox.run(["/bin/sh", "-c", "echo ran > ran.txt"], cwd=root)
+
+    assert not (root / "ran.txt").exists()
+    assert sandbox.disabled_reason is not None
+    assert str(error) in sandbox.disabled_reason
+    assert len(sandbox.finished) == 1
+    assert "Sandbox commands turned off" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_cancelling_during_the_sweep_waits_for_it_once(root: Path) -> None:
+    sandbox = FailingSweep(SandboxPolicy(Workspace(root)), None, pause=0.3)
+    run = asyncio.create_task(sandbox.run(["true"], cwd=root))
+    await asyncio.to_thread(sandbox.started.wait, 5)
+    # Twice: the second lands while the run is already waiting for the sweep.
+    run.cancel()
+    await asyncio.sleep(0.05)
+    run.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await run
+    # One sweep, in a thread (not blocking the event loop), finished before
+    # the run returned and before its run directory was removed.
+    assert len(sandbox.threads) == 1
+    assert sandbox.threads[0] != threading.get_ident()
+    assert sandbox.finished == [True]
+    assert sandbox.disabled_reason is None
+
+
+@pytest.mark.anyio
+async def test_a_sweep_that_fails_after_a_cancel_still_turns_commands_off(
+    root: Path,
+) -> None:
+    sandbox = FailingSweep(
+        SandboxPolicy(Workspace(root)), ContainmentError(UNSIGNALLABLE), pause=0.2
+    )
+    run = asyncio.create_task(sandbox.run(["true"], cwd=root))
+    await asyncio.to_thread(sandbox.started.wait, 5)
+    run.cancel()
+
+    # The cancellation wins over the sweep's error, but it's still recorded.
+    with pytest.raises(asyncio.CancelledError):
+        await run
+    assert sandbox.disabled_reason == UNSIGNALLABLE
+
+
+class FirstSweepFails(RecordsSweeps):
+    """The first command's sweep fails; later ones succeed."""
+
+    def sweep(self, run: RunDir, pgid: int) -> None:
+        super().sweep(run, pgid)
+        if len(self.sweeps) == 1:
+            raise ContainmentError(UNSIGNALLABLE)
+
+
+@pytest.mark.anyio
+async def test_a_failed_sweep_stops_commands_already_running(root: Path) -> None:
+    sandbox = FirstSweepFails(SandboxPolicy(Workspace(root)))
+    running = asyncio.create_task(
+        sandbox.run(
+            ["/bin/sh", "-c", 'echo "$$" > pid; exec sleep 60'], cwd=root, timeout=30
+        )
+    )
+    for _ in range(100):
+        if (root / "pid").exists() and (root / "pid").read_text().strip():
+            break
+        await asyncio.sleep(0.02)
+
+    with pytest.raises(ContainmentError):
+        await sandbox.run(["true"], cwd=root)
+
+    # The running command is stopped at once, not left to finish.
+    with pytest.raises(ContainmentError, match="until the service restarts"):
+        await asyncio.wait_for(running, timeout=5)
+    assert await gone(int((root / "pid").read_text()))
+    assert len(sandbox.sweeps) == 2
+
+
+class FailsWhileSweeping(RecordsSweeps):
+    """Another command's sweep fails while this one's runs."""
+
+    def sweep(self, run: RunDir, pgid: int) -> None:
+        super().sweep(run, pgid)
+        self.disabled_reason = UNSIGNALLABLE
+
+
+@pytest.mark.anyio
+async def test_a_command_that_ends_after_a_failed_sweep_reports_it(
+    root: Path,
+) -> None:
+    # It exited before the runner noticed, so only the final check can
+    # catch it.
+    sandbox = FailsWhileSweeping(SandboxPolicy(Workspace(root)))
+
+    with pytest.raises(ContainmentError, match="until the service restarts"):
+        await sandbox.run(["true"], cwd=root)
 
 
 @pytest.mark.anyio

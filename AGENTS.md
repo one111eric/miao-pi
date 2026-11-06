@@ -175,9 +175,25 @@ Command sandbox (`app/agent/sandbox/`, plan and findings in
     command's sandbox. It recognizes a process with the private
     `sandbox_check`: sandboxed, may read the run's `marker`, may not read
     its `canary`. Both files sit in the run directory next to `home/` (the
-    scratch directory), where commands can't change them. The runner calls
-    `ConfinedSandbox.sweep` right after the group kill, on the cancel path
-    too, and before waiting for output.
+    scratch directory), where commands can't change them.
+  - The runner's `_end` kills the group, then sweeps once, in a thread,
+    before waiting for output. A cancellation, even a repeated one, waits
+    for the sweep to finish (it must finish before the run directory is
+    removed) and is raised afterwards. Never call a sweep on the event
+    loop thread.
+  - A sweep that can't end everything raises `ContainmentError`, and
+    `ConfinedSandbox._sweep` turns any sweep error into one. The command
+    fails instead of returning a result, and `disabled_reason` makes the
+    sandbox refuse every later command until restart, since what's left can
+    still change the workspace. On the cancel path the cancellation is
+    raised, but the sandbox still turns commands off.
+  - Commands run concurrently, so turning commands off also stops the ones
+    already running: the runner's poll checks `stop`
+    (`ConfinedSandbox._refusal`), and `run` checks once more after
+    `run_process` returns. Don't serialize `run()` with a lock instead;
+    one long command would block every other conversation.
+  - That's detection, not containment: a failed sweep's processes may keep
+    running (still sandboxed). Don't describe it as a guaranteed end.
   - The self-test plants a sandboxed process in a session of its own and
     requires the sweep to kill it, so a macOS update that breaks
     `sandbox_check` turns commands off.
@@ -404,8 +420,9 @@ change its shape.
   refused.
 - On macOS, a process started with `posix_spawn`'s `setsid` or `setpgroup`
   option escapes the group kill; only the sweep ends it. A process that
-  runs as another user (a setuid program) can't be signalled and is only
-  logged. On Linux the PID namespace ends everything.
+  runs as another user (a setuid program) can't be signalled: the command
+  fails with `ContainmentError` and commands stay off until restart. On
+  Linux the PID namespace ends everything.
 - Inside the sandbox a denied-name symlink reaches its target
   (`.env.link -> notes.txt` reads `notes.txt`), on both backends, though
   `Workspace.resolve` refuses the name. The deny list protects files where

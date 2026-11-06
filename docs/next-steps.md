@@ -433,12 +433,16 @@ through the API.
 
 **Status: built (2026-11-05),** with one gap: the bubblewrap backend isn't
 tested on Linux yet. On macOS, a sweep after each command ends processes
-that left its process group, which Seatbelt alone can't prevent.
+that left its process group, which Seatbelt alone can't prevent. If it
+can't, that's detected: the command fails, running commands are stopped,
+and commands stay off until restart.
 
 Commands the agent runs can't reach beyond the workspace, even if the
 command itself is malicious: no network, writes only inside the workspace,
-reads denied outside it, the deny list enforced, a clean environment, and a
-known end for every command. The detailed plan, including the decision to
+reads denied outside it, the deny list enforced, and a clean environment.
+Every command ends within its timeout, or a containment failure is detected
+and reported, with any leftover processes still confined by the sandbox.
+The detailed plan, including the decision to
 use the OS's own sandbox (Seatbelt on macOS, bubblewrap on Linux) rather
 than containers, is in [sandbox.md](sandbox.md).
 

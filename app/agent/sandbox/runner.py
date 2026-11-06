@@ -32,7 +32,18 @@ BASE_ENV = {"LANG": "C.UTF-8", "TERM": "dumb", "NO_COLOR": "1"}
 
 
 # Ends a command's processes that its group kill missed, given the group id.
+# Raises when it can't be sure they're gone.
 type Sweep = Callable[[int], None]
+# Why a running command must be stopped now, or None to let it run.
+type StopCheck = Callable[[], str | None]
+
+
+class ContainmentError(RuntimeError):
+    """A command's processes may still be running after it ended.
+
+    Raised instead of a result, since anything left running can keep
+    changing the workspace.
+    """
 
 
 @dataclass(frozen=True)
@@ -98,20 +109,52 @@ def _signal_group(pgid: int, sig: signal.Signals) -> None:
         pass
 
 
-async def _exited(process: asyncio.subprocess.Process, timeout: float) -> bool:
+async def _exited(
+    process: asyncio.subprocess.Process, timeout: float, stop: StopCheck | None
+) -> bool:
     """Whether the process exits within ``timeout`` seconds.
 
     This watches ``returncode`` instead of awaiting ``wait()``: on Python
     3.12 and later, ``wait()`` doesn't return until the output pipe closes,
-    and a background process the command started can hold it open.
+    and a background process the command started can hold it open. Raises
+    ``ContainmentError`` as soon as ``stop`` gives a reason.
     """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     while process.returncode is None:
+        if stop is not None and (reason := stop()) is not None:
+            raise ContainmentError(reason)
         if loop.time() >= deadline:
             return False
         await asyncio.sleep(_POLL_SECONDS)
     return True
+
+
+async def _end(pgid: int, sweep: Sweep | None) -> None:
+    """Kill the command's group, then sweep, once and to the end.
+
+    The sweep runs in a thread, since it can take a while against a fork
+    loop. A cancellation doesn't cut it short: the thread would keep going
+    anyway, and the run directory it relies on must outlast it. So this
+    waits for it, and raises the cancellation once it's done.
+    """
+    _signal_group(pgid, signal.SIGKILL)
+    if sweep is None:
+        return
+    sweeping = asyncio.create_task(asyncio.to_thread(sweep, pgid))
+    cancelled: asyncio.CancelledError | None = None
+    while not sweeping.done():
+        try:
+            await asyncio.shield(sweeping)
+        except asyncio.CancelledError as error:
+            cancelled = error
+        except Exception:
+            pass  # the sweep failed; raised below unless cancelled
+    if cancelled is not None:
+        if not sweeping.cancelled():
+            sweeping.exception()  # retrieved, so asyncio doesn't report it
+        raise cancelled
+    sweeping.result()
 
 
 async def run_process(
@@ -122,6 +165,7 @@ async def run_process(
     timeout: float,
     max_output_bytes: int,
     sweep: Sweep | None = None,
+    stop: StopCheck | None = None,
 ) -> CommandResult:
     """Run ``command`` in its own process group and always end it.
 
@@ -131,6 +175,13 @@ async def run_process(
     escapes that kill; ``sweep``, run right after it, is the backend's
     chance to end those. If one still holds the output open, the output is
     given up on after a short grace period instead of waiting for it.
+
+    A sweep that fails raises its error here instead of a result. When the
+    caller was cancelled, the cancellation is raised instead, so a sweep
+    must also record its own failure (``ConfinedSandbox`` does). While the
+    command runs, ``stop`` is checked every poll; once it gives a reason,
+    the command is ended like a cancelled one and ``ContainmentError`` is
+    raised.
     """
     started_at = perf_counter()
     process = await asyncio.create_subprocess_exec(
@@ -150,29 +201,33 @@ async def run_process(
     reader = asyncio.create_task(_drain(process.stdout, tail))
     timed_out = False
     try:
-        if not await _exited(process, timeout):
+        if not await _exited(process, timeout, stop):
             timed_out = True
             _signal_group(process.pid, signal.SIGTERM)
-            await _exited(process, KILL_GRACE_SECONDS)
-        # Also ends what the command left running, which holds the pipe open.
-        _signal_group(process.pid, signal.SIGKILL)
-        if sweep is not None:
-            # In a thread: a sweep can take a while against a fork loop.
-            await asyncio.to_thread(sweep, process.pid)
-        try:
-            async with asyncio.timeout(PIPE_CLOSE_SECONDS):
-                await reader
-        except TimeoutError:
-            reader.cancel()
-            logger.warning("Command output stayed open after the command ended")
+            await _exited(process, KILL_GRACE_SECONDS, stop)
     except BaseException:
-        # Cancelled (or failed) mid-run: the command must not keep running.
+        # Cancelled, stopped, or failed mid-run: the command must not keep
+        # running.
         # asyncio reaps the process once it's gone.
         reader.cancel()
-        _signal_group(process.pid, signal.SIGKILL)
-        if sweep is not None:
-            sweep(process.pid)
+        try:
+            await _end(process.pid, sweep)
+        except (Exception, asyncio.CancelledError):
+            pass  # a failed sweep or a second cancellation; the first error wins
         raise
+    try:
+        # Also ends what the command left running, which holds the pipe open.
+        await _end(process.pid, sweep)
+    except BaseException:
+        reader.cancel()
+        raise
+    # Cancelling here cancels the reader too; the command has ended already.
+    try:
+        async with asyncio.timeout(PIPE_CLOSE_SECONDS):
+            await reader
+    except TimeoutError:
+        reader.cancel()
+        logger.warning("Command output stayed open after the command ended")
 
     return CommandResult(
         exit_code=None if timed_out else process.returncode,

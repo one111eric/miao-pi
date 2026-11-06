@@ -21,10 +21,11 @@ Operation not permitted``).
 
 ``sandbox_check`` is private but long-standing (Chromium uses it), so a
 macOS update could break it. ``SeatbeltSandbox.self_check`` proves at
-startup that it still finds and ends such a process. Two limits remain: a
-process id freed and reused between the check and the kill (a window of
-microseconds), and a process running as another user, such as a setuid
-program, which can't be signalled; that one is logged.
+startup that it still finds and ends such a process. When the sweep can't
+end every process (one running as another user, such as a setuid program,
+can't be signalled, and a fork loop could outlast it), it raises
+``ContainmentError``. One limit remains: a process id freed and reused
+between the check and the kill, a window of microseconds.
 """
 
 import ctypes
@@ -34,6 +35,8 @@ import signal
 import time
 from functools import cache
 from pathlib import Path
+
+from app.agent.sandbox.runner import ContainmentError
 
 logger = logging.getLogger(__name__)
 
@@ -146,13 +149,16 @@ def end_run_processes(run_dir: Path, pgid: int) -> None:
 
     Called once ``pgid`` (the command's group) has been killed. Processes
     still in that group are dying already; the ones outside it escaped,
-    and are logged.
+    and are logged. Raises ``ContainmentError`` if any is still running.
     """
     escaped: set[int] = set()
     unkillable: set[int] = set()
-    remaining: list[int] = []
+
+    def left() -> list[int]:
+        return [pid for pid in run_processes(run_dir) if pid not in unkillable]
+
     for _ in range(MAX_PASSES):
-        remaining = [pid for pid in run_processes(run_dir) if pid not in unkillable]
+        remaining = left()
         if not remaining:
             break
         for pid in remaining:
@@ -165,18 +171,20 @@ def end_run_processes(run_dir: Path, pgid: int) -> None:
             except PermissionError:
                 unkillable.add(pid)
         time.sleep(_PASS_PAUSE_SECONDS)
+    else:
+        # The last pass's kills haven't been checked yet.
+        remaining = left()
     if escaped:
         logger.warning(
             "Ended processes that left the command's process group",
             extra={"count": len(escaped)},
         )
+    problems = []
     if unkillable:
-        logger.error(
-            "A command left processes running that can't be signalled",
-            extra={"count": len(unkillable)},
-        )
+        problems.append(f"{len(unkillable)} can't be signalled")
     if remaining:
-        logger.error(
-            "A command's processes outlasted the sweep",
-            extra={"count": len(remaining), "passes": MAX_PASSES},
+        problems.append(f"{len(remaining)} outlasted {MAX_PASSES} passes")
+    if problems:
+        raise ContainmentError(
+            f"the command left processes running: {', '.join(problems)}"
         )

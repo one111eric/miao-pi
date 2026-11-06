@@ -26,17 +26,28 @@ Every backend enforces all of these, and an opt-in test proves each one:
 3. **Reads only inside the workspace, the scratch directory, system
    directories, and configured toolchain paths.** Not the rest of the home
    directory (`~/.ssh`, `~/.aws`, browser profiles).
-4. **The deny list still applies inside the workspace**: `.env*`, `.git`,
-   `.claude`, and configured patterns can't be read or written. A symlink
-   pointing outside the workspace leads nowhere.
+4. **The deny list still applies inside the workspace**: files and
+   directories matched by `.env*`, `.git`, `.claude`, and configured
+   patterns can't be read or written. The rules protect files where they
+   are, not names: a symlink with a denied name, such as
+   `.env.link -> notes.txt`, still reaches its target, which is readable
+   under its own name anyway. A symlink to a denied file gets nothing, and
+   one pointing outside the workspace leads nowhere.
 5. **A clean environment.** Nothing from the service's own environment is
    passed through, API keys included.
-6. **A known end.** Every command finishes within its timeout or is killed,
-   with its whole process tree, and the caller gets the outcome either way.
-   That's what step 6's "every approved action ends with a known, saved
-   result" needs for commands. On macOS, where a process can leave the
+6. **A known end, or a detected failure.** Every command finishes within
+   its timeout or is killed, with its whole process tree, and the caller
+   gets the outcome either way. On macOS, where a process can leave the
    command's process group in a way Seatbelt can't block, a sweep finds it
    by its sandbox and kills it (see "The sweep" under the Seatbelt backend).
+   If the sweep can't end every one, that's a containment failure, and it's
+   detected, not prevented: the leftover processes may keep running, still
+   confined by the sandbox, and can still change the workspace. The command
+   fails with `ContainmentError` instead of a result. Commands already
+   running are stopped and fail the same way, and every later one is
+   refused until the service restarts. So no command's result looks normal
+   once containment has failed. For step 6's "every approved action ends
+   with a known, saved result", that error is the saved result.
 
 There's no unsandboxed fallback. If no backend works on the machine, command
 tools aren't offered to the model at all.
@@ -218,9 +229,28 @@ class SandboxPolicy:
   wait a short grace period (2s), then send `SIGKILL`. The result has
   `timed_out=True`, `exit_code=None`, and the output captured so far.
 - **Cancellation:** if the caller is cancelled (step 6's backstop deadline,
-  a client disconnect), a `finally` kills the process group before
-  re-raising. Unlike a tool in a worker thread, a subprocess can always be
-  stopped, so nothing keeps running after its request ends.
+  a client disconnect), the runner kills the process group and sweeps
+  before re-raising. Unlike a tool in a worker thread, a subprocess can
+  always be stopped, so nothing keeps running after its request ends.
+- **Ending a command** (`_end`): the group kill, then the backend's sweep,
+  once per command, in a thread so it never blocks the event loop. A
+  cancellation, even a repeated one, doesn't cut the sweep short: the
+  thread would keep going anyway, and the run directory it relies on must
+  outlast it. The runner waits for it, then raises the cancellation.
+- **A failed sweep:** `run_process` raises its error instead of returning a
+  result. When the caller was cancelled, the cancellation wins, so
+  `ConfinedSandbox` records the failure itself: any error from a sweep
+  becomes `ContainmentError` and turns commands off until restart, logged
+  once as `Sandbox commands turned off` with the reason.
+- **Stopping other commands:** commands run concurrently (step 6's tool
+  calls in one response, or several conversations), so turning commands
+  off must also reach the ones already running. The runner's 20 ms poll
+  checks `stop` (`ConfinedSandbox._refusal`). Once commands are off, it
+  ends a running command the way it ends a cancelled one and raises
+  `ContainmentError`. A command that exited between two polls is caught
+  by one more check after it returns. A lock around `run()` would also
+  close the race, but only one command could run at a time across the
+  whole service.
 - **Output cap:** read in chunks and keep only the last
   `sandbox_max_output_bytes` in memory (a bounded buffer), so a command that
   prints gigabytes can't exhaust memory. Decode as UTF-8 with replacement.
@@ -314,17 +344,21 @@ until none is left. It runs before the run directory is removed.
     missing path answers "denied", so a command could move its own scratch
     directory away.
 - **When it runs:**
-  - Right after the group kill, both on the normal path (in a thread) and
-    when the caller is cancelled.
+  - Once per command, right after the group kill, in a thread, whether
+    the command ended normally or the caller was cancelled (see "Ending a
+    command" under the runner).
   - Before the runner waits for the output pipe, so an escaped process
     holding the pipe doesn't hold up the result.
 - **Fork loops:** each pass kills every match. In the spike, a process
   forking in a loop took two passes, 232 processes in 0.4 s. After 50
-  passes the sweep gives up and logs an error.
-- **Logging:**
-  - `Ended processes that left the command's process group`, with a count,
-    when it ended any.
-  - An error for processes it couldn't signal, or that outlasted it.
+  passes it checks once more, and if anything is left it gives up.
+- **When it can't end everything:** a process it can't signal, or one
+  still there after the last pass, makes it raise `ContainmentError`. The
+  command fails and commands stay off until restart (see "A failed sweep"
+  under the runner).
+- **Logging:** `Ended processes that left the command's process group`,
+  with a count, when it ended any. A failure is logged once, as `Sandbox
+  commands turned off`.
 - **Cost:** a pass over about 600 processes takes about 4 ms.
 - **Limits:**
   - `sandbox_check` is private, though long-standing (Chromium uses it).
@@ -334,7 +368,11 @@ until none is left. It runs before the run directory is removed.
   - A process id freed and reused between the check and the kill could be
     hit. The window is microseconds.
   - A process running as another user, such as a setuid program, can't be
-    signalled. It's logged.
+    signalled. The command fails and commands are turned off.
+  - Turning commands off doesn't stop what's left; it only keeps it from
+    being mistaken for a finished command. For a command that must be
+    assumed hostile, a VM or the Linux PID namespace is the stronger
+    boundary.
   - A zombie doesn't match, so it can't stall the sweep.
 
 ### Bubblewrap backend (`bubblewrap.py`)
@@ -397,10 +435,14 @@ Runs `bwrap <args…> -- <argv…>` with:
 - **Approval card:** `run_command(argv, cwd?)` requires approval (5a). The
   card shows the exact argv, the working directory, and the timeout.
 - **Results:** a `CommandResult` becomes the tool result: the exit code (or
-  "killed after 120s"), the output tail, and a notice when it was cut.
-- **Known end:** together with step 6's deadline between steps, a command
-  always ends with a saved result. It finishes, it's killed by its own
-  timeout, or, if the backstop cancels the run, the runner kills it.
+  "killed after 120s"), the output tail, and a notice when it was cut. A
+  `ContainmentError` becomes an error result saying commands are off until
+  the service restarts.
+- **Known end:** together with step 6's deadline between steps, every
+  command ends with a saved result. It finishes, it's killed by its own
+  timeout, or, if the backstop cancels the run, the runner kills it. If
+  containment fails, the saved result is the `ContainmentError`, and
+  processes may be left running in the sandbox.
 
 ## Tests
 
@@ -432,7 +474,13 @@ Runs `bwrap <args…> -- <argv…>` with:
     leaves no survivors);
   - output keeps the tail and sets `truncated`;
   - exit codes come through;
-  - cancelling the caller kills the command.
+  - cancelling the caller kills the command;
+  - cancelling during the sweep, even twice, waits for that one sweep, run
+    in a thread, before the run directory is removed;
+  - a failed sweep fails the command and turns commands off, even when the
+    caller was cancelled;
+  - a failed sweep stops commands already running, and a command that
+    ends just after it fails too.
 
 **Opt-in integration tests** (`RUN_SANDBOX_TESTS=1`, a `sandbox` marker,
 skipped when the platform's backend is unavailable), run against the real

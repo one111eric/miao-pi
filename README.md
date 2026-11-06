@@ -144,11 +144,17 @@ on Linux (install the `bubblewrap` package). A sandboxed command:
 - has no network access, not even to `localhost`;
 - can write only inside the workspace;
 - can read only the workspace, system directories, and paths you list;
-- can't touch `.env*`, `.git`, `.claude`, or your configured deny patterns;
+- can't read or write files matched by `.env*`, `.git`, `.claude`, or your
+  configured deny patterns. The rules protect files where they are, not
+  names: a symlink named `.env.link` that points to `notes.txt` still
+  reaches `notes.txt`, which is readable under its own name anyway;
 - gets a clean environment, none of the service's variables;
 - is killed, with everything it started, when it runs past its timeout
   (on macOS, processes that leave the command's process group are found by
-  their sandbox and killed after it; see `docs/sandbox.md`).
+  their sandbox and killed after it; see `docs/sandbox.md`). If any can't
+  be ended, they may keep running, still sandboxed: the command fails,
+  commands already running are stopped, and no further command runs until
+  you restart the service.
 
 ```env
 SANDBOX_BACKEND=auto            # or seatbelt, bubblewrap, off

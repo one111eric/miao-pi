@@ -10,12 +10,13 @@ from app.agent.sandbox.policy import (
     SandboxPolicy,
     resolve_read_paths,
 )
-from app.agent.sandbox.runner import CommandResult
+from app.agent.sandbox.runner import CommandResult, ContainmentError
 
 __all__ = [
     "CommandResult",
     "CommandSettings",
     "ConfinedSandbox",
+    "ContainmentError",
     "RunDir",
     "Sandbox",
     "SandboxConfigError",
