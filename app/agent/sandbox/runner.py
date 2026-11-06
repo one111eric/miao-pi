@@ -1,0 +1,172 @@
+"""Running one confined command: environment, timeout, kill, and output.
+
+Backends only decide how a command is confined (the argument prefix). This
+module does the rest, so every backend behaves the same way.
+"""
+
+import asyncio
+import logging
+import os
+import signal
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from time import perf_counter
+
+logger = logging.getLogger(__name__)
+
+# Seconds a timed-out command gets between SIGTERM and SIGKILL.
+KILL_GRACE_SECONDS = 2.0
+# Seconds to wait for the output pipe to close once everything is killed.
+PIPE_CLOSE_SECONDS = 2.0
+_POLL_SECONDS = 0.02
+_READ_CHUNK = 64 * 1024
+
+# Make package managers fail fast instead of hanging with no network.
+OFFLINE_ENV = {
+    "UV_OFFLINE": "1",
+    "PIP_NO_INDEX": "1",
+    "NPM_CONFIG_OFFLINE": "true",
+}
+BASE_ENV = {"LANG": "C.UTF-8", "TERM": "dumb", "NO_COLOR": "1"}
+
+
+@dataclass(frozen=True)
+class CommandResult:
+    # None when the command was killed.
+    exit_code: int | None
+    # stdout and stderr interleaved; only the tail when truncated.
+    output: str
+    truncated: bool
+    timed_out: bool
+    duration_ms: float
+
+
+def build_env(
+    *,
+    path: str,
+    scratch: Path,
+    extra: Mapping[str, str],
+) -> dict[str, str]:
+    """The whole environment a command sees; nothing is inherited.
+
+    The service's own environment can hold API keys, so it's never passed on.
+    """
+    return {
+        **BASE_ENV,
+        **OFFLINE_ENV,
+        **extra,
+        "PATH": path,
+        "HOME": str(scratch),
+        "TMPDIR": f"{scratch}/",
+    }
+
+
+class _Tail:
+    """Keeps the last ``limit`` bytes written to it, and counts the rest."""
+
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._data = bytearray()
+        self.total = 0
+
+    def add(self, chunk: bytes) -> None:
+        self.total += len(chunk)
+        self._data += chunk
+        if len(self._data) > self._limit:
+            del self._data[: len(self._data) - self._limit]
+
+    def text(self) -> str:
+        return self._data.decode("utf-8", errors="replace")
+
+
+async def _drain(stream: asyncio.StreamReader, tail: _Tail) -> None:
+    while chunk := await stream.read(_READ_CHUNK):
+        tail.add(chunk)
+
+
+def _signal_group(pgid: int, sig: signal.Signals) -> None:
+    try:
+        os.killpg(pgid, sig)
+    except (ProcessLookupError, PermissionError):
+        # Nothing left to signal. macOS reports a group whose members have
+        # all exited, and are waiting to be reaped, as EPERM.
+        pass
+
+
+async def _exited(process: asyncio.subprocess.Process, timeout: float) -> bool:
+    """Whether the process exits within ``timeout`` seconds.
+
+    This watches ``returncode`` instead of awaiting ``wait()``: on Python
+    3.12 and later, ``wait()`` doesn't return until the output pipe closes,
+    and a background process the command started can hold it open.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while process.returncode is None:
+        if loop.time() >= deadline:
+            return False
+        await asyncio.sleep(_POLL_SECONDS)
+    return True
+
+
+async def run_process(
+    command: Sequence[str],
+    *,
+    cwd: Path,
+    env: Mapping[str, str],
+    timeout: float,
+    max_output_bytes: int,
+) -> CommandResult:
+    """Run ``command`` in its own process group and always end it.
+
+    The command is killed with everything it started when it times out, and
+    when the caller is cancelled. Processes it leaves behind after exiting
+    normally are killed too. One that leaves the group itself (calling
+    ``setsid``) can't be reached this way; the output is then given up on
+    after a short grace period instead of waiting for it.
+    """
+    started_at = perf_counter()
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        cwd=cwd,
+        env=dict(env),
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        # The command leads its own process group, so one signal reaches
+        # everything it starts.
+        start_new_session=True,
+    )
+    if process.stdout is None:  # can't happen with stdout=PIPE; narrows the type
+        raise RuntimeError("command output pipe missing")
+    tail = _Tail(max_output_bytes)
+    reader = asyncio.create_task(_drain(process.stdout, tail))
+    timed_out = False
+    try:
+        if not await _exited(process, timeout):
+            timed_out = True
+            _signal_group(process.pid, signal.SIGTERM)
+            await _exited(process, KILL_GRACE_SECONDS)
+        # Also ends what the command left running, which holds the pipe open.
+        _signal_group(process.pid, signal.SIGKILL)
+        try:
+            async with asyncio.timeout(PIPE_CLOSE_SECONDS):
+                await reader
+        except TimeoutError:
+            reader.cancel()
+            logger.warning("Command output stayed open after the command ended")
+    except BaseException:
+        # Cancelled (or failed) mid-run: the command must not keep running.
+        # asyncio reaps the process once it's gone.
+        reader.cancel()
+        _signal_group(process.pid, signal.SIGKILL)
+        raise
+
+    return CommandResult(
+        exit_code=None if timed_out else process.returncode,
+        output=tail.text(),
+        truncated=tail.total > max_output_bytes,
+        timed_out=timed_out,
+        duration_ms=round((perf_counter() - started_at) * 1000, 2),
+    )

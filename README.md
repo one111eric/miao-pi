@@ -135,6 +135,40 @@ message to it returns `409`; a resume for a thread with nothing pending also
 returns `409`. A waiting thread still expires after `THREAD_TTL`. The test
 page shows pending actions with Approve and Reject buttons.
 
+## Command sandbox
+
+The commands the agent will run (from step 6 of the roadmap) execute in the
+operating system's own sandbox: Seatbelt on macOS, built in, or bubblewrap
+on Linux (install the `bubblewrap` package). A sandboxed command:
+
+- has no network access, not even to `localhost`;
+- can write only inside the workspace;
+- can read only the workspace, system directories, and paths you list;
+- can't touch `.env*`, `.git`, `.claude`, or your configured deny patterns;
+- gets a clean environment, none of the service's variables;
+- is killed, with everything it started, when it runs past its timeout.
+
+```env
+SANDBOX_BACKEND=auto            # or seatbelt, bubblewrap, off
+SANDBOX_COMMAND_TIMEOUT=120
+SANDBOX_READ_PATHS=["~/.local/share/uv/python", "~/.local/bin"]
+```
+
+`SANDBOX_READ_PATHS` is for toolchains installed under your home directory,
+which is otherwise unreadable; the example covers uv. Dependency installs
+can't work without network, so run those outside the sandbox. At startup
+the service self-tests the sandbox and logs the result as `sandbox` in
+`Startup complete`. If no sandbox works, command tools are simply not
+offered; nothing ever runs unsandboxed.
+
+The sandbox has opt-in tests that run real commands:
+
+```bash
+RUN_SANDBOX_TESTS=1 uv run pytest -m sandbox
+```
+
+Design, decisions, and known limits are in `docs/sandbox.md`.
+
 ## Test UI
 
 A developer page for trying the agent in a browser. It shows each reply, the

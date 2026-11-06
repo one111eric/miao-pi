@@ -43,8 +43,9 @@ Fix formatting with `uv run isort . && uv run black .`.
   `nodes.py` (async node functions), `graph.py` (wiring and compile),
   `service.py` (runs or resumes the graph for a request), `approval.py`
   (pausing for a human before tools with side effects), `workspace.py` (the
-  boundary for project files), and `tools/` (the read-only tools, one module
-  each, plus `tool_utils/` with the shared `files.py` and `output.py`).
+  boundary for project files), `tools/` (the read-only tools, one module
+  each, plus `tool_utils/` with the shared `files.py` and `output.py`), and
+  `sandbox/` (running commands confined to the workspace).
 - `common/` — code shared across features: `config.py` (`SvcSettings`),
   `llm/` (`LLM`, a `ChatOpenAI` subclass), `logging_helper.py`.
 - `tests/unit/` — no network, no app lifespan.
@@ -137,6 +138,38 @@ Tools (`app/agent/tools/`):
   the contents) of an outside directory.
 - `read` stops at the first cap: a cut notice gives the file's size, not its
   line count, because counting would read the whole file.
+
+Command sandbox (`app/agent/sandbox/`, plan and findings in
+`docs/sandbox.md`). Nothing calls it yet; step 6's `run_command` will:
+
+- At startup, `make_sandbox` picks Seatbelt on macOS or bubblewrap on Linux
+  and self-tests it: a plain command must work, a canary file outside the
+  workspace must be unreadable, and a localhost listener must get no
+  connection. It sets `app.state.sandbox` to the sandbox, or to `None` when
+  none works. There's no unsandboxed mode: without a sandbox, command tools
+  aren't offered. `Startup complete` logs `sandbox` (the backend, `off`, or
+  `unavailable: <reason>`).
+- A backend only builds the command line that confines a command
+  (`confine`). `ConfinedSandbox.run` and `runner.run_process` do the rest
+  for every backend:
+  - an environment built from scratch, never inherited;
+  - a fresh scratch directory as `HOME` and `TMPDIR`;
+  - the timeout: `SIGTERM`, then `SIGKILL`, to the whole process group;
+  - killing what the command left running;
+  - keeping the last `sandbox_max_output_bytes` of output.
+- Never `await process.wait()` in the runner: on Python 3.12 and later it
+  waits for the output pipe to close, which a leftover background process
+  can delay forever. Watch `returncode` instead.
+- Seatbelt rules:
+  - Deny by default.
+  - Deny rules must come after the allows, because the last matching rule
+    wins (`test_the_profile_denies_by_default_and_puts_denies_last`).
+  - No `mach-lookup`, and signals only within the sandbox.
+  - Deny patterns become case-insensitive regexes (`glob_to_regex`), and
+    paths are passed as `-D` parameters.
+- bubblewrap unshares every namespace and, before each command, masks the
+  workspace's existing denied paths using `Workspace.is_denied`. It has
+  unit tests only; it hasn't run on Linux yet.
 
 Run limits (`AgentLimits`, from `agent_max_steps` and `agent_run_timeout`):
 
@@ -284,6 +317,12 @@ change its shape.
 - Unit-test tools by invoking them with a tool-call dict, the way `ToolNode`
   does, so errors come back as `ToolMessage(status="error")` (see `call` in
   `tests/unit/test_read_tools.py`).
+- `tests/conftest.py` sets `SANDBOX_BACKEND=off` for every test, so app
+  startup skips the sandbox self-test. Tests that need a sandbox build one.
+  `UnconfinedSandbox` in `tests/fakes.py` confines nothing and exists only to
+  test process handling; `FakeSandbox` runs nothing and records calls.
+  The opt-in tests against the real backend need
+  `RUN_SANDBOX_TESTS=1 uv run pytest -m sandbox`.
 - `serve(model, root, extra_tools)` in `tests/apps.py` runs the app with its
   lifespan, a given model, and a workspace, when the `client` fixture's
   `EchoChatModel` won't do. `recording_tool(effects)` in `tests/fakes.py` is
@@ -340,6 +379,16 @@ change its shape.
 - With `dev_ui_enabled`, anyone who can reach the server can read any
   thread's history, tool results included. Keep it off outside local
   development until 7b adds authentication and ownership checks.
+- Inside the sandbox, a project's `.env` is unreadable on macOS
+  (`PermissionError`) and empty on Linux. Code that loads `.env`, like this
+  repo's `SvcSettings`, therefore fails sandboxed on macOS: 73 of this
+  repo's tests do.
+- Toolchains installed under the home directory (uv's Python, pyenv, cargo)
+  need their paths in `sandbox_read_paths`; the home directory itself is
+  refused.
+- On macOS a command's process that calls `setsid` escapes the timeout's
+  group kill and keeps running, still confined; the runner just stops
+  waiting for its output. On Linux the PID namespace ends it.
 
 ## Rules
 
