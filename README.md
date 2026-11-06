@@ -146,7 +146,9 @@ on Linux (install the `bubblewrap` package). A sandboxed command:
 - can read only the workspace, system directories, and paths you list;
 - can't touch `.env*`, `.git`, `.claude`, or your configured deny patterns;
 - gets a clean environment, none of the service's variables;
-- is killed, with everything it started, when it runs past its timeout.
+- is killed, with everything it started, when it runs past its timeout
+  (on macOS, processes that leave the command's process group are found by
+  their sandbox and killed after it; see `docs/sandbox.md`).
 
 ```env
 SANDBOX_BACKEND=auto            # or seatbelt, bubblewrap, off

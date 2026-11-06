@@ -431,8 +431,9 @@ through the API.
 
 ## 5b. Command sandbox
 
-**Status: built (2026-11-05),** with the bubblewrap backend not yet tested
-on Linux.
+**Status: built (2026-11-05),** with one gap: the bubblewrap backend isn't
+tested on Linux yet. On macOS, a sweep after each command ends processes
+that left its process group, which Seatbelt alone can't prevent.
 
 Commands the agent runs can't reach beyond the workspace, even if the
 command itself is malicious: no network, writes only inside the workspace,

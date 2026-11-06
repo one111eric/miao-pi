@@ -4,6 +4,7 @@ import re
 import shutil
 import signal
 import sys
+import time
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -12,14 +13,16 @@ import pytest
 from app.agent.sandbox import (
     CommandResult,
     CommandSettings,
+    RunDir,
     Sandbox,
     SandboxConfigError,
     SandboxPolicy,
     resolve_read_paths,
+    seatbelt_sweep,
     startup,
 )
 from app.agent.sandbox.bubblewrap import BubblewrapSandbox
-from app.agent.sandbox.runner import BASE_ENV, OFFLINE_ENV
+from app.agent.sandbox.runner import BASE_ENV, OFFLINE_ENV, PIPE_CLOSE_SECONDS
 from app.agent.sandbox.seatbelt import (
     SANDBOX_EXEC,
     SeatbeltSandbox,
@@ -126,7 +129,7 @@ def test_only_a_safe_regex_subset_is_emitted(root: Path) -> None:
         assert re.search(r"(?<!\\)[{}+|]", regex) is None, regex
 
 
-def test_unsupported_class_characters_fail_at_startup(root: Path) -> None:
+def test_unsupported_class_characters_are_refused(root: Path) -> None:
     with pytest.raises(SandboxConfigError, match="unsupported deny pattern"):
         SeatbeltSandbox(SandboxPolicy(Workspace(root, denied_paths=("key[$]",))))
 
@@ -140,6 +143,10 @@ def test_the_profile_denies_by_default_and_puts_denies_last(root: Path) -> None:
     assert "network" not in profile
     assert "mach-lookup" not in profile
     assert "(allow signal (target same-sandbox))" in lines
+    # Leaving the process group would escape the timeout's kill.
+    assert "(deny syscall-unix (syscall-number SYS_setsid SYS_setpgid))" in lines
+    # How the sweep recognizes this run's processes.
+    assert '(allow file-read-data (literal (param "MARKER")))' in lines
     assert '(subpath (param "READ_0"))' in profile
     assert profile.count('(regex #"') == len(workspace.denied_patterns)
     # In Seatbelt the last matching rule wins.
@@ -152,11 +159,13 @@ def test_seatbelt_passes_paths_as_parameters(root: Path) -> None:
     tools = root.parent / "tools"
     sandbox = SeatbeltSandbox(SandboxPolicy(Workspace(root), read_paths=(tools,)))
 
-    command = sandbox.confine(["make", "test"], cwd=root, scratch=root.parent / "s")
+    run = RunDir(root.parent / "run")
+    command = sandbox.confine(["make", "test"], cwd=root, run=run)
 
     assert command[:3] == [str(SANDBOX_EXEC), "-p", sandbox.profile]
     assert contains(command, ["-D", f"WORKSPACE={root}"])
-    assert contains(command, ["-D", f"SCRATCH={root.parent / 's'}"])
+    assert contains(command, ["-D", f"SCRATCH={run.path / 'home'}"])
+    assert contains(command, ["-D", f"MARKER={run.path / 'marker'}"])
     assert contains(command, ["-D", f"READ_0={tools}"])
     assert command[-2:] == ["make", "test"]
 
@@ -167,6 +176,107 @@ def test_seatbelt_refuses_a_root_it_cant_quote(tmp_path: Path) -> None:
 
     with pytest.raises(SandboxConfigError, match="quote"):
         SeatbeltSandbox(SandboxPolicy(Workspace(quoted)))
+
+
+def test_seatbelt_keeps_its_marker_where_commands_cant_change_it(root: Path) -> None:
+    sandbox = SeatbeltSandbox(SandboxPolicy(Workspace(root)))
+
+    with sandbox.new_run() as run:
+        assert (run.path / "marker").is_file()
+        assert (run.path / "canary").is_file()
+        # Only scratch is writable inside the sandbox; the files sit beside it.
+        assert list(run.scratch.iterdir()) == []
+        assert run.scratch.parent == run.path
+    assert not run.path.exists()
+
+
+class FakeProcesses:
+    """Stands in for libSystem: each process's group and what it may read."""
+
+    def __init__(self) -> None:
+        self.table: dict[int, tuple[bool, set[bytes], int]] = {}
+        self.unkillable: set[int] = set()
+        self.respawn = False
+        self.killed: list[int] = []
+
+    def add(self, pid: int, *, sandboxed: bool, reads: set[bytes], pgid: int) -> None:
+        self.table[pid] = (sandboxed, reads, pgid)
+
+    def pids(self) -> list[int]:
+        return list(self.table)
+
+    def sandboxed(self, pid: int) -> bool:
+        return self.table[pid][0]
+
+    def may_read(self, pid: int, path: bytes) -> bool:
+        return path in self.table[pid][1]
+
+    def getpgid(self, pid: int) -> int:
+        return self.table[pid][2]
+
+    def kill(self, pid: int, sig: int) -> None:
+        if pid not in self.table:
+            raise ProcessLookupError(pid)
+        if pid in self.unkillable:
+            raise PermissionError(pid)
+        self.killed.append(pid)
+        entry = self.table.pop(pid)
+        if self.respawn:
+            # A fork loop: every kill finds a new child already started.
+            self.table[pid + 1000] = entry
+
+
+@pytest.fixture
+def processes(monkeypatch: pytest.MonkeyPatch) -> FakeProcesses:
+    fake = FakeProcesses()
+    monkeypatch.setattr(seatbelt_sweep, "_libsystem", lambda: fake)
+    monkeypatch.setattr(os, "kill", fake.kill)
+    monkeypatch.setattr(os, "getpgid", fake.getpgid)
+    monkeypatch.setattr(seatbelt_sweep, "_PASS_PAUSE_SECONDS", 0)
+    return fake
+
+
+def test_the_sweep_ends_only_this_runs_processes(
+    tmp_path: Path, processes: FakeProcesses, caplog: pytest.LogCaptureFixture
+) -> None:
+    run_dir = tmp_path / "run"
+    marker = os.fsencode(run_dir / "marker")
+    canary = os.fsencode(run_dir / "canary")
+    other_marker = os.fsencode(tmp_path / "other" / "marker")
+    processes.add(10, sandboxed=True, reads={marker}, pgid=100)  # dying in group
+    processes.add(11, sandboxed=True, reads={marker}, pgid=11)  # escaped
+    processes.add(12, sandboxed=False, reads={marker, canary}, pgid=12)
+    processes.add(13, sandboxed=True, reads={other_marker}, pgid=13)  # other run
+    processes.add(14, sandboxed=True, reads={marker, canary}, pgid=14)  # other app
+    processes.add(15, sandboxed=True, reads={marker}, pgid=15)  # setuid, say
+    processes.unkillable = {15}
+
+    seatbelt_sweep.end_run_processes(run_dir, pgid=100)
+
+    assert sorted(processes.killed) == [10, 11]
+    assert sorted(processes.table) == [12, 13, 14, 15]
+    messages = {record.getMessage(): record for record in caplog.records}
+    escaped = messages["Ended processes that left the command's process group"]
+    assert getattr(escaped, "count") == 2
+    assert "A command left processes running that can't be signalled" in messages
+    assert "A command's processes outlasted the sweep" not in messages
+
+
+def test_the_sweep_gives_up_on_a_fork_loop_and_says_so(
+    tmp_path: Path,
+    processes: FakeProcesses,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(seatbelt_sweep, "MAX_PASSES", 3)
+    marker = os.fsencode(tmp_path / "marker")
+    processes.add(10, sandboxed=True, reads={marker}, pgid=10)
+    processes.respawn = True
+
+    seatbelt_sweep.end_run_processes(tmp_path, pgid=10)
+
+    assert len(processes.killed) == 3
+    assert "A command's processes outlasted the sweep" in caplog.text
 
 
 # Bubblewrap
@@ -186,10 +296,12 @@ def test_bubblewrap_masks_denied_paths_and_unshares_everything(
         (root / name).parent.mkdir(parents=True, exist_ok=True)
         (root / name).write_text("x", encoding="utf-8")
     (root / "alias").symlink_to(root / ".env")
+    (root / ".env.link").symlink_to(root / "keep.txt")
     sandbox = BubblewrapSandbox(SandboxPolicy(Workspace(root)))
-    scratch = root.parent / "scratch"
+    run = RunDir(root.parent / "run")
+    scratch = run.scratch
 
-    command = sandbox.confine(["make", "test"], cwd=root, scratch=scratch)
+    command = sandbox.confine(["make", "test"], cwd=root, run=run)
 
     assert command[:4] == [
         "/usr/bin/bwrap",
@@ -205,6 +317,9 @@ def test_bubblewrap_masks_denied_paths_and_unshares_everything(
     # Nothing inside a masked directory, and no symlinks, are mounted over.
     assert not any(arg.startswith(f"{root}/.git/") for arg in command)
     assert f"{root}/alias" not in command
+    # A denied-name symlink reaches only its target, readable under its own
+    # name anyway; mounting over the link would mount over the target.
+    assert f"{root}/.env.link" not in command
     # Masks come after the workspace bind, so they sit on top of it.
     assert command.index("--tmpfs") > command.index(str(root))
     assert command[-5:] == ["--chdir", str(root), "--", "make", "test"]
@@ -243,9 +358,10 @@ async def test_home_is_a_scratch_directory_removed_afterwards(
     result = await unconfined.run(["/bin/sh", "-c", 'echo "$HOME"'], cwd=root)
 
     home = Path(result.output.strip())
-    assert home.name.startswith("miao-pi-cmd-")
+    assert home.name == "home"
+    assert home.parent.name.startswith("miao-pi-cmd-")
     assert not home.is_relative_to(root)
-    assert not home.exists()
+    assert not home.parent.exists()
 
 
 @pytest.mark.anyio
@@ -302,6 +418,69 @@ async def test_a_process_that_leaves_its_group_cant_stall_the_call(
                 os.kill(int((root / "pid").read_text()), signal.SIGKILL)
                 break
             await asyncio.sleep(0.02)
+
+
+class RecordsSweeps(UnconfinedSandbox):
+    """Records each sweep: whether the run directory existed, and the group."""
+
+    def __init__(self, policy: SandboxPolicy) -> None:
+        super().__init__(policy)
+        self.sweeps: list[tuple[bool, int]] = []
+
+    def sweep(self, run: RunDir, pgid: int) -> None:
+        self.sweeps.append((run.path.is_dir(), pgid))
+
+
+class EndsEscapedProcess(RecordsSweeps):
+    """Its sweep also ends the process whose id the command wrote to ``pid``."""
+
+    def sweep(self, run: RunDir, pgid: int) -> None:
+        super().sweep(run, pgid)
+        pid_file = self.policy.workspace.root / "pid"
+        for _ in range(100):
+            if pid_file.exists() and pid_file.read_text():
+                os.kill(int(pid_file.read_text()), signal.SIGKILL)
+                return
+            time.sleep(0.01)
+
+
+@pytest.mark.anyio
+async def test_the_sweep_runs_before_waiting_for_output(
+    root: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The escaped process holds the output pipe open. The sweep runs right
+    # after the group kill, while the run directory still exists, so ending
+    # it there means the call doesn't wait out the pipe grace period.
+    sandbox = EndsEscapedProcess(SandboxPolicy(Workspace(root)))
+    escape = (
+        "import os, time\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid()\n"
+        "    open('pid', 'w').write(str(os.getpid()))\n"
+        "    time.sleep(60)\n"
+    )
+
+    result = await sandbox.run([sys.executable, "-c", escape], cwd=root, timeout=10)
+
+    assert result.exit_code == 0
+    assert result.duration_ms < PIPE_CLOSE_SECONDS * 1000
+    assert "Command output stayed open" not in caplog.text
+    assert len(sandbox.sweeps) == 1
+    run_dir_existed, pgid = sandbox.sweeps[0]
+    assert run_dir_existed and pgid > 0
+    assert await gone(int((root / "pid").read_text()))
+
+
+@pytest.mark.anyio
+async def test_cancelling_the_caller_sweeps_too(root: Path) -> None:
+    sandbox = RecordsSweeps(SandboxPolicy(Workspace(root)))
+    run = asyncio.create_task(sandbox.run(["/bin/sleep", "60"], cwd=root))
+    await asyncio.sleep(0.2)
+    run.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await run
+    assert [existed for existed, _ in sandbox.sweeps] == [True]
 
 
 @pytest.mark.anyio
@@ -385,13 +564,51 @@ async def test_the_fake_sandbox_records_calls(root: Path) -> None:
 # Startup
 
 
+class BlocksOnlyReads(UnconfinedSandbox):
+    """A broken backend: it stops `cat` but lets every write through."""
+
+    def confine(
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: Path,
+        run: RunDir,
+    ) -> list[str]:
+        return ["false"] if argv[0] == "cat" else list(argv)
+
+
+class FailsToStart(UnconfinedSandbox):
+    async def run(
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: Path,
+        timeout: float | None = None,
+    ) -> CommandResult:
+        raise FileNotFoundError("sandbox launcher is gone")
+
+
 @pytest.mark.anyio
 async def test_the_self_test_catches_a_sandbox_that_confines_nothing(
     unconfined: UnconfinedSandbox,
 ) -> None:
-    assert await startup.self_test(unconfined) == (
-        "a file outside the workspace was readable"
-    )
+    assert await startup.self_test(unconfined) == "a denied file was readable"
+
+
+@pytest.mark.anyio
+async def test_the_self_test_catches_writes_that_get_through(root: Path) -> None:
+    sandbox = BlocksOnlyReads(SandboxPolicy(Workspace(root)))
+
+    assert await startup.self_test(sandbox) == "a denied file was writable"
+
+
+@pytest.mark.anyio
+async def test_the_self_test_leaves_the_real_workspace_alone(
+    root: Path, unconfined: UnconfinedSandbox
+) -> None:
+    await startup.self_test(unconfined)
+
+    assert list(root.iterdir()) == []
 
 
 @pytest.mark.anyio
@@ -424,9 +641,32 @@ async def test_startup_disables_commands_without_a_working_sandbox(
     assert named.status == "unavailable: bubblewrap isn't available here"
     assert (failing.sandbox, failing.status) == (
         None,
-        "unavailable: a file outside the workspace was readable",
+        "unavailable: a denied file was readable",
     )
     assert "Sandbox self-test failed" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_backend_errors_disable_commands_instead_of_crashing(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = SvcSettings(sandbox_backend=SandboxBackend.AUTO)
+
+    monkeypatch.setattr(startup, "_choose", lambda setting: FailsToStart)
+    gone = await startup.make_sandbox(settings, Workspace(root))
+    monkeypatch.setattr(startup, "_choose", lambda setting: SeatbeltSandbox)
+    inexpressible = await startup.make_sandbox(
+        settings, Workspace(root, denied_paths=("key[$]",))
+    )
+
+    assert (gone.sandbox, gone.status) == (
+        None,
+        "unavailable: FileNotFoundError: sandbox launcher is gone",
+    )
+    assert inexpressible.sandbox is None
+    assert inexpressible.status.startswith(
+        "unavailable: SandboxConfigError: unsupported deny pattern"
+    )
 
 
 @pytest.mark.anyio

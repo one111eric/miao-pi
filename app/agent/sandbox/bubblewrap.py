@@ -12,7 +12,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from app.agent.sandbox.base import CommandSettings, ConfinedSandbox
+from app.agent.sandbox.base import CommandSettings, ConfinedSandbox, RunDir
 from app.agent.sandbox.policy import SandboxConfigError, SandboxPolicy
 
 # Mounted read-only when they exist.
@@ -78,15 +78,17 @@ class BubblewrapSandbox(ConfinedSandbox):
         argv: Sequence[str],
         *,
         cwd: Path,
-        scratch: Path,
+        run: RunDir,
     ) -> list[str]:
         root = str(self.policy.workspace.root)
+        scratch = str(run.scratch)
         args = [self.executable, "--unshare-all", "--die-with-parent", "--new-session"]
         for path in (*map(Path, SYSTEM_READ_PATHS), *self.policy.read_paths):
             args += _read_only(path)
         # The workspace and scratch keep their real paths, so tools inside
-        # see the same paths as on the host.
-        args += ["--bind", root, root, "--bind", str(scratch), str(scratch)]
+        # see the same paths as on the host. The PID namespace ends every
+        # process when the command does, so there's nothing to sweep.
+        args += ["--bind", root, root, "--bind", scratch, scratch]
         args += ["--dev", "/dev", "--proc", "/proc"]
         # After the workspace bind, so the masks sit on top of it.
         args += self.masks()

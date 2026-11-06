@@ -8,7 +8,7 @@ import asyncio
 import logging
 import os
 import signal
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
@@ -29,6 +29,10 @@ OFFLINE_ENV = {
     "NPM_CONFIG_OFFLINE": "true",
 }
 BASE_ENV = {"LANG": "C.UTF-8", "TERM": "dumb", "NO_COLOR": "1"}
+
+
+# Ends a command's processes that its group kill missed, given the group id.
+type Sweep = Callable[[int], None]
 
 
 @dataclass(frozen=True)
@@ -117,14 +121,16 @@ async def run_process(
     env: Mapping[str, str],
     timeout: float,
     max_output_bytes: int,
+    sweep: Sweep | None = None,
 ) -> CommandResult:
     """Run ``command`` in its own process group and always end it.
 
     The command is killed with everything it started when it times out, and
     when the caller is cancelled. Processes it leaves behind after exiting
-    normally are killed too. One that leaves the group itself (calling
-    ``setsid``) can't be reached this way; the output is then given up on
-    after a short grace period instead of waiting for it.
+    normally are killed too. A process that leaves the group (``setsid``)
+    escapes that kill; ``sweep``, run right after it, is the backend's
+    chance to end those. If one still holds the output open, the output is
+    given up on after a short grace period instead of waiting for it.
     """
     started_at = perf_counter()
     process = await asyncio.create_subprocess_exec(
@@ -150,6 +156,9 @@ async def run_process(
             await _exited(process, KILL_GRACE_SECONDS)
         # Also ends what the command left running, which holds the pipe open.
         _signal_group(process.pid, signal.SIGKILL)
+        if sweep is not None:
+            # In a thread: a sweep can take a while against a fork loop.
+            await asyncio.to_thread(sweep, process.pid)
         try:
             async with asyncio.timeout(PIPE_CLOSE_SECONDS):
                 await reader
@@ -161,6 +170,8 @@ async def run_process(
         # asyncio reaps the process once it's gone.
         reader.cancel()
         _signal_group(process.pid, signal.SIGKILL)
+        if sweep is not None:
+            sweep(process.pid)
         raise
 
     return CommandResult(

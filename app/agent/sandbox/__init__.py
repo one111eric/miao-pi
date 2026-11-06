@@ -4,7 +4,7 @@ See docs/sandbox.md for the guarantees, the decisions, and how each backend
 was checked.
 """
 
-from app.agent.sandbox.base import CommandSettings, ConfinedSandbox, Sandbox
+from app.agent.sandbox.base import CommandSettings, ConfinedSandbox, RunDir, Sandbox
 from app.agent.sandbox.policy import (
     SandboxConfigError,
     SandboxPolicy,
@@ -16,6 +16,7 @@ __all__ = [
     "CommandResult",
     "CommandSettings",
     "ConfinedSandbox",
+    "RunDir",
     "Sandbox",
     "SandboxConfigError",
     "SandboxPolicy",

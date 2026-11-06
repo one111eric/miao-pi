@@ -143,17 +143,20 @@ Command sandbox (`app/agent/sandbox/`, plan and findings in
 `docs/sandbox.md`). Nothing calls it yet; step 6's `run_command` will:
 
 - At startup, `make_sandbox` picks Seatbelt on macOS or bubblewrap on Linux
-  and self-tests it: a plain command must work, a canary file outside the
-  workspace must be unreadable, and a localhost listener must get no
-  connection. It sets `app.state.sandbox` to the sandbox, or to `None` when
-  none works. There's no unsandboxed mode: without a sandbox, command tools
+  and self-tests it. A plain command runs in the real workspace; the rest
+  runs in a throwaway workspace built the same way, never the real one.
+  There, a write must work, and these must fail: reading or changing a
+  denied `.env`, reading or writing outside, and reaching a localhost
+  listener. It sets `app.state.sandbox` to the sandbox, or to `None` when
+  none works. Any exception while building or testing a backend also
+  means `None`; only a bad `sandbox_read_paths` entry fails startup. There's no unsandboxed mode: without a sandbox, command tools
   aren't offered. `Startup complete` logs `sandbox` (the backend, `off`, or
   `unavailable: <reason>`).
 - A backend only builds the command line that confines a command
   (`confine`). `ConfinedSandbox.run` and `runner.run_process` do the rest
   for every backend:
   - an environment built from scratch, never inherited;
-  - a fresh scratch directory as `HOME` and `TMPDIR`;
+  - a fresh run directory (`RunDir`), whose `home/` is `HOME` and `TMPDIR`;
   - the timeout: `SIGTERM`, then `SIGKILL`, to the whole process group;
   - killing what the command left running;
   - keeping the last `sandbox_max_output_bytes` of output.
@@ -165,6 +168,19 @@ Command sandbox (`app/agent/sandbox/`, plan and findings in
   - Deny rules must come after the allows, because the last matching rule
     wins (`test_the_profile_denies_by_default_and_puts_denies_last`).
   - No `mach-lookup`, and signals only within the sandbox.
+  - `setsid` and `setpgid` are denied with a `syscall-unix` rule, since
+    `(deny default)` doesn't cover system calls.
+  - `posix_spawn`'s `setsid` and `setpgroup` options still leave the group,
+    so after every command `seatbelt_sweep` kills what's left in that
+    command's sandbox. It recognizes a process with the private
+    `sandbox_check`: sandboxed, may read the run's `marker`, may not read
+    its `canary`. Both files sit in the run directory next to `home/` (the
+    scratch directory), where commands can't change them. The runner calls
+    `ConfinedSandbox.sweep` right after the group kill, on the cancel path
+    too, and before waiting for output.
+  - The self-test plants a sandboxed process in a session of its own and
+    requires the sweep to kill it, so a macOS update that breaks
+    `sandbox_check` turns commands off.
   - Deny patterns become case-insensitive regexes (`glob_to_regex`), and
     paths are passed as `-D` parameters.
 - bubblewrap unshares every namespace and, before each command, masks the
@@ -386,9 +402,14 @@ change its shape.
 - Toolchains installed under the home directory (uv's Python, pyenv, cargo)
   need their paths in `sandbox_read_paths`; the home directory itself is
   refused.
-- On macOS a command's process that calls `setsid` escapes the timeout's
-  group kill and keeps running, still confined; the runner just stops
-  waiting for its output. On Linux the PID namespace ends it.
+- On macOS, a process started with `posix_spawn`'s `setsid` or `setpgroup`
+  option escapes the group kill; only the sweep ends it. A process that
+  runs as another user (a setuid program) can't be signalled and is only
+  logged. On Linux the PID namespace ends everything.
+- Inside the sandbox a denied-name symlink reaches its target
+  (`.env.link -> notes.txt` reads `notes.txt`), on both backends, though
+  `Workspace.resolve` refuses the name. The deny list protects files where
+  they are; the target is readable under its own name anyway.
 
 ## Rules
 

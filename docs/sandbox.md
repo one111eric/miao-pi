@@ -34,7 +34,9 @@ Every backend enforces all of these, and an opt-in test proves each one:
 6. **A known end.** Every command finishes within its timeout or is killed,
    with its whole process tree, and the caller gets the outcome either way.
    That's what step 6's "every approved action ends with a known, saved
-   result" needs for commands.
+   result" needs for commands. On macOS, where a process can leave the
+   command's process group in a way Seatbelt can't block, a sweep finds it
+   by its sandbox and kills it (see "The sweep" under the Seatbelt backend).
 
 There's no unsandboxed fallback. If no backend works on the machine, command
 tools aren't offered to the model at all.
@@ -139,6 +141,7 @@ app/agent/sandbox/
   policy.py       # what's readable, writable, and denied (backend-neutral)
   runner.py       # spawning, environment, timeout and kill, output capture
   seatbelt.py     # macOS: policy -> Seatbelt profile -> sandbox-exec argv
+  seatbelt_sweep.py  # macOS: ending processes that left the command's group
   bubblewrap.py   # Linux: policy -> bwrap argv
 ```
 
@@ -237,9 +240,11 @@ Builds a profile and runs `sandbox-exec -p <profile> <argv…>`:
 (allow signal (target same-sandbox))
 (allow ipc-posix-sem)
 (allow file-read-metadata)
+(deny syscall-unix (syscall-number SYS_setsid SYS_setpgid))
 (allow file-read* <system dirs> <sandbox_read_paths>)
 (allow file-read* file-write* (subpath WORKSPACE) (subpath SCRATCH))
 (allow file-write* (literal "/dev/null"))
+(allow file-read-data (literal MARKER))
 (deny file-read* file-write* (regex <one per denied pattern>))
 ```
 
@@ -248,6 +253,11 @@ Builds a profile and runs `sandbox-exec -p <profile> <argv…>`:
 - Signals reach only processes in the same sandbox, so a command can't kill
   the user's other programs.
 - `ipc-posix-sem` is the one IPC rule needed, by Python's `multiprocessing`.
+- `setsid` and `setpgid` are denied explicitly, because `(deny default)`
+  doesn't cover system calls. Either one lets a process leave the command's
+  process group and escape the timeout's kill. `posix_spawn`'s `setsid`
+  and `setpgroup` options still do, so the sweep (below) ends those.
+- `MARKER` is how the sweep recognizes this run's processes.
 
 - No `network*` rule is allowed, so all network access is denied by
   `(deny default)`.
@@ -272,6 +282,60 @@ Builds a profile and runs `sandbox-exec -p <profile> <argv…>`:
   are skipped, because macOS counts processes per user, so a low limit
   would also hit the user's other programs. The wall-clock timeout bounds
   CPU time too.
+
+#### The sweep (`seatbelt_sweep.py`)
+
+`posix_spawn`'s `setsid` and `setpgroup` options move the new process out
+of the command's group inside the spawn call, which Seatbelt can't filter,
+so the group kill misses it. After every command, the sweep finds the
+processes still in that command's sandbox and kills them, pass after pass,
+until none is left. It runs before the run directory is removed.
+
+- **How it recognizes a process:**
+  - Each command gets a run directory holding `home/` (the scratch
+    directory, its `HOME` and `TMPDIR`), with `marker` and `canary` beside
+    it.
+  - The profile lets commands read `marker` (the `MARKER` parameter), but
+    not `canary`.
+  - macOS's `sandbox_check(pid, "file-read-data", path)` answers that
+    question for any process.
+  - So a process belongs to this run when it's sandboxed, may read this
+    run's marker, and may not read its canary. Unsandboxed processes may
+    read both, and another run's processes may read only their own marker.
+- **Why a command can't hide from it:**
+  - Only `home/` is writable, so a command can't move or delete the marker,
+    the canary, or the directory holding them. Each attempt got `Operation
+    not permitted`.
+  - It can't add a second profile that denies the marker. macOS refuses to
+    sandbox an already-sandboxed process (`sandbox_apply: Operation not
+    permitted`).
+  - The first idea, checking "may write this run's scratch directory",
+    could have been evaded. `sandbox_check` looks the path up, and a
+    missing path answers "denied", so a command could move its own scratch
+    directory away.
+- **When it runs:**
+  - Right after the group kill, both on the normal path (in a thread) and
+    when the caller is cancelled.
+  - Before the runner waits for the output pipe, so an escaped process
+    holding the pipe doesn't hold up the result.
+- **Fork loops:** each pass kills every match. In the spike, a process
+  forking in a loop took two passes, 232 processes in 0.4 s. After 50
+  passes the sweep gives up and logs an error.
+- **Logging:**
+  - `Ended processes that left the command's process group`, with a count,
+    when it ended any.
+  - An error for processes it couldn't signal, or that outlasted it.
+- **Cost:** a pass over about 600 processes takes about 4 ms.
+- **Limits:**
+  - `sandbox_check` is private, though long-standing (Chromium uses it).
+    The startup self-test plants a sandboxed `sleep` in a session of its
+    own and requires the sweep to kill it. If a macOS update breaks the
+    call, commands are turned off rather than run without the sweep.
+  - A process id freed and reused between the check and the kill could be
+    hit. The window is microseconds.
+  - A process running as another user, such as a setuid program, can't be
+    signalled. It's logged.
+  - A zombie doesn't match, so it can't stall the sweep.
 
 ### Bubblewrap backend (`bubblewrap.py`)
 
@@ -311,13 +375,20 @@ Runs `bwrap <args…> -- <argv…>` with:
 - **Choosing a backend:** with `auto`, use Seatbelt on macOS if
   `/usr/bin/sandbox-exec` exists, or bubblewrap on Linux if `bwrap` is on
   `PATH`.
-- **Self-test before trusting it:** a command that must succeed (`true`),
-  one that must fail to read a canary file outside the workspace, and one
-  that must fail to connect to a listener the service opens on `127.0.0.1`
-  for the test. If any check comes out wrong, log an error and treat the
-  sandbox as unavailable.
-- **Logging:** `Startup complete` gains `sandbox_backend` (its name, or
-  `unavailable` with the reason).
+- **Self-test before trusting it:** a plain command (`true`) must run in the
+  real workspace. Everything else runs in a throwaway workspace built the
+  same way (same backend, deny patterns, read paths, and settings), so the
+  real one is never written to. There, a command must be able to write a
+  file. It must fail to read or change a canary `.env`, to read a canary
+  outside the workspace, to write outside it, and to connect to a listener
+  the service opens on `127.0.0.1`. On macOS the sweep must also kill a
+  sandboxed process planted in a session of its own.
+- **Failing closed:** a failed check, a backend that can't express the deny
+  list, or a launcher that won't start all log an error and leave the
+  sandbox unavailable; none of them stops the service. Only a mistyped
+  `sandbox_read_paths` entry fails startup.
+- **Logging:** `Startup complete` gains `sandbox` (the backend's name,
+  `off`, or `unavailable: <reason>`).
 - **Without a sandbox,** step 6 doesn't register `run_command`, so the model
   never sees it.
 
@@ -414,21 +485,50 @@ decisions above are in AGENTS.md.
   pipe closes, and a background process the command left behind holds it
   open: the first version waited out the whole timeout. Leftovers are now
   killed as soon as the command exits.
-- **A process that leaves its group** (calls `setsid`) escapes the group
-  kill. The runner stops waiting for its output after 2 seconds instead of
-  hanging. On Linux the PID namespace ends it with the sandbox; on macOS it
-  keeps running, still confined. A unit test covers the no-hang part.
+- **A process that leaves its group** escapes the group kill. The runner
+  stops waiting for its output after 2 seconds instead of hanging (a unit
+  test covers this). On Linux the PID namespace ends it with the sandbox.
+  On macOS, a review found that both `setsid` and `setpgid` worked inside
+  Seatbelt, and the survivor kept running, still confined, after the
+  command's timeout. The profile now denies both system calls, and an
+  opt-in test proves they fail. One way remained open: `posix_spawn` with
+  its `setsid` or `setpgroup` option changes the session inside the spawn
+  call, which Seatbelt can't filter, and a `sleep` started that way
+  outlived the command. The sweep now closes it (see "The sweep"). The
+  spike first confirmed what the design rests on: `sandbox_check` can be
+  called from Python (ctypes passes its variadic path argument correctly on
+  arm64), it identifies exactly one run's processes among about 600, a
+  zombie doesn't match, and a command can neither move the marker nor stack
+  a second profile. Breaking the sweep on purpose, by removing the marker
+  rule or the sweep itself, fails the self-test, and the survivor then
+  holds the output open for the full 2 seconds.
+- **Denied-name symlinks reach their target, on both backends.** With
+  `.env.link -> notes.txt`, `cat .env.link` prints `notes.txt`, while
+  `Workspace.resolve` refuses the name. Nothing extra is exposed:
+  `notes.txt` is readable under its own name in every channel. Masking the
+  link isn't an option either, since mounting over a symlink mounts over its
+  target. An opt-in test pins the behavior: the link reaches its target, and
+  a link to a denied file gets nothing.
 - **macOS reports an empty process group as `EPERM`,** not "no such
   process", so the runner treats both as already gone.
 - **Smaller profile:** see the Seatbelt section.
 - **Skipped:** the `take_tail` helper (the runner's own bounded buffer does
   the job) and `RLIMIT_CPU` (the wall-clock timeout bounds it).
 
-**Opt-in tests:** all 12 pass against Seatbelt on macOS 26.6.2
-(`RUN_SANDBOX_TESTS=1 uv run pytest -m sandbox`): the self-test, reads and
-writes inside, each denied path, outside paths and a symlink, no network,
-a clean environment, timeouts, and this repo's Python with its interpreter
-as a read path.
+**Opt-in tests:** all 17 pass against Seatbelt on macOS 26.6.2
+(`RUN_SANDBOX_TESTS=1 uv run pytest -m sandbox`):
+- the self-test;
+- reads and writes inside the workspace;
+- each denied path;
+- outside paths and a symlink;
+- no network;
+- a clean environment;
+- timeouts;
+- `setsid` and `setpgid` refused;
+- processes spawned out of the group with `posix_spawn` (`setsid` and
+  `setpgroup`) swept, with other commands left alone;
+- denied-name symlinks;
+- this repo's Python, with its interpreter as a read path.
 
 **Toolchain check, this repo, macOS.** Both read paths are under the home
 directory, so they need listing:
@@ -454,8 +554,9 @@ nothing instead. Both keep the secret out. If it becomes a problem, the
 options are a test configuration that doesn't load `.env`, or keeping
 secrets outside the workspace.
 
-**Still to do:** run the opt-in tests on a Linux machine, where `bwrap` is
-installed and user namespaces are allowed.
+**Still to do:**
+- **Linux:** run the opt-in tests on a machine where `bwrap` is installed
+  and user namespaces are allowed.
 
 ## Later, not in 5b
 

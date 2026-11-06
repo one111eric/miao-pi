@@ -5,14 +5,19 @@ Code and Anthropic's sandbox-runtime use it the same way. See
 docs/sandbox.md for what each rule is for and how it was checked.
 """
 
+import asyncio
+import signal
 import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from app.agent.sandbox.base import CommandSettings, ConfinedSandbox
+from app.agent.sandbox import seatbelt_sweep
+from app.agent.sandbox.base import CommandSettings, ConfinedSandbox, RunDir
 from app.agent.sandbox.policy import SandboxConfigError, SandboxPolicy
 
 SANDBOX_EXEC = Path("/usr/bin/sandbox-exec")
+# Seconds the self-check gives the sweep to find its planted process.
+SWEEP_CHECK_SECONDS = 5.0
 
 # Real paths: on macOS, /etc, /var, and /tmp live under /private.
 SYSTEM_READ_SUBPATHS = (
@@ -34,6 +39,11 @@ SYSTEM_READ_LITERALS = ("/", "/private", "/etc", "/var", "/tmp")
 # network (no rule, so all of it is denied), mach-lookup (system services,
 # some of which launch apps outside the sandbox), and signals to processes
 # outside the sandbox. ipc-posix-sem is what Python's multiprocessing needs.
+#
+# setsid and setpgid are denied explicitly, since (deny default) doesn't
+# cover system calls: a process that leaves the command's process group
+# escapes the timeout's kill. posix_spawn's setsid and setpgroup options
+# still get around this, so the sweep (seatbelt_sweep) ends those.
 _PROFILE_HEAD = """\
 (version 1)
 (deny default)
@@ -41,6 +51,7 @@ _PROFILE_HEAD = """\
 (allow signal (target same-sandbox))
 (allow ipc-posix-sem)
 (allow file-read-metadata)
+(deny syscall-unix (syscall-number SYS_setsid SYS_setpgid))
 """
 
 _REGEX_SPECIAL = frozenset(".^$*+?()[]{}|\\")
@@ -145,6 +156,8 @@ def build_profile(policy: SandboxPolicy) -> str:
         + '(allow file-read* file-write* (subpath (param "WORKSPACE"))'
         + ' (subpath (param "SCRATCH")))\n'
         + '(allow file-write* (literal "/dev/null"))\n'
+        # How the sweep recognizes this run's processes; see seatbelt_sweep.
+        + '(allow file-read-data (literal (param "MARKER")))\n'
         # Last on purpose: in Seatbelt the last matching rule wins, so the
         # deny list must follow the workspace allow.
         + f"(deny file-read* file-write* {denies})\n"
@@ -174,14 +187,63 @@ class SeatbeltSandbox(ConfinedSandbox):
         argv: Sequence[str],
         *,
         cwd: Path,
-        scratch: Path,
+        run: RunDir,
     ) -> list[str]:
         params = [
             "-D",
             f"WORKSPACE={self.policy.workspace.root}",
             "-D",
-            f"SCRATCH={scratch}",
+            f"SCRATCH={run.scratch}",
+            "-D",
+            f"MARKER={run.path / seatbelt_sweep.MARKER}",
         ]
         for index, path in enumerate(self.policy.read_paths):
             params += ["-D", f"READ_{index}={path}"]
         return [str(SANDBOX_EXEC), "-p", self.profile, *params, *argv]
+
+    def prepare(self, run: RunDir) -> None:
+        seatbelt_sweep.create_marker(run.path)
+
+    def sweep(self, run: RunDir, pgid: int) -> None:
+        seatbelt_sweep.end_run_processes(run.path, pgid)
+
+    async def self_check(self) -> str | None:
+        """Prove the sweep ends a process that left its process group.
+
+        It plants one: a sandboxed ``sleep`` started in a session of its
+        own, the way posix_spawn's setsid option would leave it.
+        """
+        seatbelt_sweep.ensure_available()
+        root = self.policy.workspace.root
+        with self.new_run() as run:
+            process = await asyncio.create_subprocess_exec(
+                *self.confine(["/bin/sleep", "60"], cwd=root, run=run),
+                cwd=root,
+                env=self.command_env(run),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            try:
+                return await self._sweep_ends(process, run)
+            finally:
+                if process.returncode is None:
+                    process.kill()
+                await process.wait()
+
+    async def _sweep_ends(
+        self, process: asyncio.subprocess.Process, run: RunDir
+    ) -> str | None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + SWEEP_CHECK_SECONDS
+        # Until sandbox-exec applies the profile, the process isn't in the
+        # sandbox yet, so the sweep may need a few tries.
+        while process.returncode is None and loop.time() < deadline:
+            await asyncio.to_thread(self.sweep, run, process.pid)
+            await asyncio.sleep(0.05)
+        if process.returncode == -signal.SIGKILL:
+            return None
+        if process.returncode is None:
+            return "the sweep didn't end a process that left its group"
+        return f"the sweep check's command exited with {process.returncode}"

@@ -15,7 +15,7 @@ from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import Field
 
 from app.agent.approval import REQUIRES_APPROVAL
-from app.agent.sandbox import CommandResult, ConfinedSandbox
+from app.agent.sandbox import CommandResult, ConfinedSandbox, RunDir
 
 # Mirrors BaseChatModel.bind_tools, whose signature uses Any.
 type BindableTool = dict[str, Any] | type | Callable[..., Any] | BaseTool
@@ -170,7 +170,7 @@ class UnconfinedSandbox(ConfinedSandbox):
         argv: Sequence[str],
         *,
         cwd: Path,
-        scratch: Path,
+        run: RunDir,
     ) -> list[str]:
         return list(argv)
 
