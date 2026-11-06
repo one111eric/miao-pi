@@ -254,9 +254,23 @@ class SandboxPolicy:
 - **Output cap:** read in chunks and keep only the last
   `sandbox_max_output_bytes` in memory (a bounded buffer), so a command that
   prints gigabytes can't exhaust memory. Decode as UTF-8 with replacement.
-- **Logging:** `Command completed` with `command` (only `argv[0]`'s base
-  name), `exit_code`, `timed_out`, `duration_ms`, and `output_bytes`. Never
-  the full argv, which can carry secrets the user typed, and never the
+- **Logging:** one line per call to `run`, whatever happened, each with
+  `command` (only `argv[0]`'s base name), `sandbox`, and `duration_ms`:
+  - `Command completed` (info) adds `exit_code`, `timed_out`, `truncated`,
+    and `output_bytes`, everything the command wrote including what was
+    cut. `CommandResult.output_bytes` carries the same number for step 6's
+    truncation notice.
+  - `Command failed` (warning) adds `error_type`. Only a `ContainmentError`
+    adds its message as `reason`: other errors' messages can quote the
+    requested path. That covers a command whose own sweep failed, one
+    stopped or refused because commands are off, a rejected `cwd`, and a
+    spawn error.
+  - `Command cancelled` (warning): the caller was cancelled, for example by
+    the run timeout, and the command was killed without a result.
+  - The self-test's commands log the same lines, marked with the context
+    field `sandbox_self_test=True`.
+
+  Never the full argv, which can carry secrets the user typed, and never the
   output, as with the read tools.
 
 ### Seatbelt backend (`seatbelt.py`)
@@ -425,8 +439,17 @@ Runs `bwrap <args…> -- <argv…>` with:
   list, or a launcher that won't start all log an error and leave the
   sandbox unavailable; none of them stops the service. Only a mistyped
   `sandbox_read_paths` entry fails startup.
-- **Logging:** `Startup complete` gains `sandbox` (the backend's name,
-  `off`, or `unavailable: <reason>`).
+- **Logging:**
+  - `Startup complete` gains `sandbox` (the backend's name, `off`, or
+    `unavailable: <reason>`) and `sandbox_read_paths` (the resolved extra
+    read paths in effect, empty without a sandbox), since a missing
+    toolchain path is the likeliest setup problem.
+  - `Sandbox unavailable` (warning, with `reason`) when no backend can run
+    here, so command tools don't turn off silently. Not when
+    `sandbox_backend` is `off`.
+  - `Sandbox self-test failed` (error, with `sandbox` and `reason`) when a
+    check fails, and with the traceback when the self-test raised, which
+    may be a bug rather than a failed check.
 - **Without a sandbox,** step 6 doesn't register `run_command`, so the model
   never sees it.
 

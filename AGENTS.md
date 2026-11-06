@@ -151,7 +151,15 @@ Command sandbox (`app/agent/sandbox/`, plan and findings in
   none works. Any exception while building or testing a backend also
   means `None`; only a bad `sandbox_read_paths` entry fails startup. There's no unsandboxed mode: without a sandbox, command tools
   aren't offered. `Startup complete` logs `sandbox` (the backend, `off`, or
-  `unavailable: <reason>`).
+  `unavailable: <reason>`) and `sandbox_read_paths`. No backend at all logs
+  a `Sandbox unavailable` warning (not for `off`), and a self-test that
+  raises logs its traceback.
+- Every `ConfinedSandbox.run` call logs exactly one line: `Command
+  completed` (with `output_bytes`), `Command failed` (`error_type`, plus
+  `reason` only for `ContainmentError`, since other messages can quote the
+  requested path), or `Command cancelled`. Self-test commands carry the
+  context field `sandbox_self_test=True`. Never log argv beyond the
+  program's name, or output.
 - A backend only builds the command line that confines a command
   (`confine`). `ConfinedSandbox.run` and `runner.run_process` do the rest
   for every backend:

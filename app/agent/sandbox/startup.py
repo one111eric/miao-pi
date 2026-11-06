@@ -14,6 +14,7 @@ from app.agent.sandbox.runner import CommandResult
 from app.agent.sandbox.seatbelt import SeatbeltSandbox
 from app.agent.workspace import Workspace
 from common.config import SandboxBackend, SvcSettings
+from common.logging_helper import logging_context
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,8 @@ class SandboxSetup:
     sandbox: Sandbox | None
     # The backend's name, "off", or "unavailable: <reason>".
     status: str
+    # The extra read paths in effect; empty without a sandbox.
+    read_paths: tuple[Path, ...] = ()
 
 
 def _choose(setting: SandboxBackend) -> BackendClass | str:
@@ -143,6 +146,8 @@ async def make_sandbox(settings: SvcSettings, workspace: Workspace) -> SandboxSe
         return SandboxSetup(None, "off")
     backend = _choose(settings.sandbox_backend)
     if isinstance(backend, str):
+        # Not an error, since nothing is broken, but command tools are off.
+        logger.warning("Sandbox unavailable", extra={"reason": backend})
         return SandboxSetup(None, f"unavailable: {backend}")
     read_paths = resolve_read_paths(settings.sandbox_read_paths)
 
@@ -156,15 +161,25 @@ async def make_sandbox(settings: SvcSettings, workspace: Workspace) -> SandboxSe
                 timeout=settings.sandbox_command_timeout,
             ),
         )
-        problem = await self_test(sandbox)
+        # Its commands log like any other; this tells them apart.
+        with logging_context(sandbox_self_test=True):
+            problem = await self_test(sandbox)
     except Exception as error:
         # Unproven means unavailable, never a crashed service or a sandbox
         # trusted without its checks.
         problem = f"{type(error).__name__}: {error}"
+        # An exception may be a bug rather than a failed check: keep its
+        # traceback.
+        logger.error(
+            "Sandbox self-test failed",
+            extra={"sandbox": backend.name, "reason": problem},
+            exc_info=True,
+        )
+        return SandboxSetup(None, f"unavailable: {problem}")
     if problem is not None:
         logger.error(
             "Sandbox self-test failed",
             extra={"sandbox": backend.name, "reason": problem},
         )
         return SandboxSetup(None, f"unavailable: {problem}")
-    return SandboxSetup(sandbox, sandbox.name)
+    return SandboxSetup(sandbox, sandbox.name, read_paths)

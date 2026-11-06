@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import re
 import shutil
@@ -14,6 +15,7 @@ import pytest
 from app.agent.sandbox import (
     CommandResult,
     CommandSettings,
+    ConfinedSandbox,
     ContainmentError,
     RunDir,
     Sandbox,
@@ -33,6 +35,7 @@ from app.agent.sandbox.seatbelt import (
 )
 from app.agent.workspace import Workspace, WorkspaceAccessError
 from common.config import SandboxBackend, SvcSettings
+from common.logging_helper import LOGGING_FORMAT, RequestFormatter
 from tests.fakes import FakeSandbox, UnconfinedSandbox
 
 
@@ -677,7 +680,7 @@ async def test_output_keeps_the_tail_and_interleaves_stderr(root: Path) -> None:
         ["/bin/sh", "-c", "echo out; echo err >&2; exit 3"], cwd=root
     )
 
-    assert (cut.output, cut.truncated) == ("qrstuvwxyz", True)
+    assert (cut.output, cut.truncated, cut.output_bytes) == ("qrstuvwxyz", True, 26)
     assert (both.output, both.truncated, both.exit_code) == ("out\nerr\n", False, 3)
 
 
@@ -713,13 +716,126 @@ async def test_bad_commands_and_directories_are_refused(
 @pytest.mark.anyio
 async def test_the_fake_sandbox_records_calls(root: Path) -> None:
     result = CommandResult(
-        exit_code=0, output="ok", truncated=False, timed_out=False, duration_ms=1.0
+        exit_code=0,
+        output="ok",
+        truncated=False,
+        output_bytes=2,
+        timed_out=False,
+        duration_ms=1.0,
     )
     sandbox: Sandbox = FakeSandbox(result)
 
     assert await sandbox.run(["make"], cwd=root, timeout=5) is result
     assert isinstance(sandbox, FakeSandbox)
     assert sandbox.calls == [(["make"], root, 5)]
+
+
+# Logging
+
+COMMAND_LOGS = {"Command completed", "Command failed", "Command cancelled"}
+
+
+def command_logs(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.getMessage() in COMMAND_LOGS]
+
+
+@pytest.mark.anyio
+async def test_a_completed_command_logs_its_full_output_size(
+    root: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="app.agent.sandbox")
+    small = UnconfinedSandbox(
+        SandboxPolicy(Workspace(root)), CommandSettings(max_output_bytes=10)
+    )
+
+    await small.run(["printf", "abcdefghijklmnopqrstuvwxyz"], cwd=root)
+
+    [record] = command_logs(caplog)
+    assert record.getMessage() == "Command completed"
+    assert getattr(record, "command") == "printf"
+    assert getattr(record, "truncated") is True
+    assert getattr(record, "output_bytes") == 26
+
+
+@pytest.mark.anyio
+async def test_a_cancelled_command_logs_that_it_was_cancelled(
+    root: Path, unconfined: UnconfinedSandbox, caplog: pytest.LogCaptureFixture
+) -> None:
+    run = asyncio.create_task(unconfined.run(["/bin/sleep", "60"], cwd=root))
+    await asyncio.sleep(0.2)
+    run.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await run
+
+    [record] = command_logs(caplog)
+    assert record.getMessage() == "Command cancelled"
+    assert getattr(record, "command") == "sleep"
+    assert getattr(record, "duration_ms") >= 200
+
+
+@pytest.mark.anyio
+async def test_a_failed_command_logs_why_but_never_the_path(
+    root: Path, unconfined: UnconfinedSandbox, caplog: pytest.LogCaptureFixture
+) -> None:
+    sandbox = FailingSweep(
+        SandboxPolicy(Workspace(root)), ContainmentError(UNSIGNALLABLE)
+    )
+
+    with pytest.raises(ContainmentError):
+        await sandbox.run(["true"], cwd=root)
+    with pytest.raises(ContainmentError):
+        await sandbox.run(["true"], cwd=root)
+    with pytest.raises(WorkspaceAccessError):
+        await unconfined.run(["true"], cwd=root / ".git")
+
+    contained, refused, rejected = command_logs(caplog)
+    for record in (contained, refused, rejected):
+        assert record.getMessage() == "Command failed"
+    assert getattr(contained, "reason") == UNSIGNALLABLE
+    assert getattr(refused, "reason").startswith("commands are off")
+    # Other errors' messages can quote the requested path; only the type.
+    assert getattr(rejected, "error_type") == "WorkspaceAccessError"
+    assert not hasattr(rejected, "reason")
+
+
+class ContextLines(logging.Handler):
+    """Each record as the service's text formatter writes it, context included."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setFormatter(RequestFormatter(LOGGING_FORMAT))
+        self.lines: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.lines.append(self.format(record))
+
+
+@pytest.mark.anyio
+async def test_the_self_tests_commands_are_marked_as_such(
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unconfined: UnconfinedSandbox,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="app.agent.sandbox")
+    handler = ContextLines()
+    logger = logging.getLogger("app.agent.sandbox")
+    logger.addHandler(handler)
+    monkeypatch.setattr(startup, "_choose", lambda setting: UnconfinedSandbox)
+    try:
+        await startup.make_sandbox(
+            SvcSettings(sandbox_backend=SandboxBackend.AUTO), Workspace(root)
+        )
+        during = [line for line in handler.lines if "msg=Command " in line]
+        handler.lines.clear()
+        await unconfined.run(["true"], cwd=root)
+    finally:
+        logger.removeHandler(handler)
+
+    assert during
+    assert all("sandbox_self_test=True" in line for line in during)
+    assert "sandbox_self_test" not in handler.lines[0]
 
 
 # Startup
@@ -805,16 +921,50 @@ async def test_startup_disables_commands_without_a_working_sandbox(
         "unavailable: a denied file was readable",
     )
     assert "Sandbox self-test failed" in caplog.text
+    # A warning when there's no backend, but none when commands were turned off.
+    unavailable = [r for r in caplog.records if r.getMessage() == "Sandbox unavailable"]
+    assert [getattr(r, "reason") for r in unavailable] == [
+        "no sandbox backend for this platform",
+        "bubblewrap isn't available here",
+    ]
+
+
+@pytest.mark.anyio
+async def test_a_working_sandbox_reports_its_read_paths(
+    tmp_path: Path, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    toolchain = tmp_path / "toolchain"
+    toolchain.mkdir()
+
+    async def passes(sandbox: ConfinedSandbox) -> str | None:
+        return None
+
+    monkeypatch.setattr(startup, "_choose", lambda setting: UnconfinedSandbox)
+    monkeypatch.setattr(startup, "self_test", passes)
+    setup = await startup.make_sandbox(
+        SvcSettings(
+            sandbox_backend=SandboxBackend.AUTO, sandbox_read_paths=(str(toolchain),)
+        ),
+        Workspace(root),
+    )
+
+    assert setup.status == "unconfined"
+    assert setup.read_paths == (toolchain.resolve(),)
 
 
 @pytest.mark.anyio
 async def test_backend_errors_disable_commands_instead_of_crashing(
-    root: Path, monkeypatch: pytest.MonkeyPatch
+    root: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     settings = SvcSettings(sandbox_backend=SandboxBackend.AUTO)
 
     monkeypatch.setattr(startup, "_choose", lambda setting: FailsToStart)
     gone = await startup.make_sandbox(settings, Workspace(root))
+    # A crash may be a bug, so its traceback is kept.
+    [crashed] = [
+        r for r in caplog.records if r.getMessage() == "Sandbox self-test failed"
+    ]
+    assert crashed.exc_info is not None
     monkeypatch.setattr(startup, "_choose", lambda setting: SeatbeltSandbox)
     inexpressible = await startup.make_sandbox(
         settings, Workspace(root, denied_paths=("key[$]",))

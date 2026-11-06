@@ -53,6 +53,8 @@ class CommandResult:
     # stdout and stderr interleaved; only the tail when truncated.
     output: str
     truncated: bool
+    # Everything the command wrote, including what was cut.
+    output_bytes: int
     timed_out: bool
     duration_ms: float
 
@@ -233,6 +235,7 @@ async def run_process(
         exit_code=None if timed_out else process.returncode,
         output=tail.text(),
         truncated=tail.total > max_output_bytes,
+        output_bytes=tail.total,
         timed_out=timed_out,
         duration_ms=round((perf_counter() - started_at) * 1000, 2),
     )

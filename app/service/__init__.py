@@ -73,6 +73,7 @@ def make_on_startup(
                 "agent_run_timeout": settings.agent_run_timeout,
                 "dev_ui_enabled": settings.dev_ui_enabled,
                 "sandbox": sandbox_setup.status,
+                "sandbox_read_paths": [str(path) for path in sandbox_setup.read_paths],
             },
         )
 

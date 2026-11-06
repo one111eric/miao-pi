@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import tempfile
 from abc import ABC, abstractmethod
@@ -6,6 +7,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
+from time import perf_counter
 from typing import ClassVar, Protocol
 
 from app.agent.sandbox.policy import SandboxPolicy
@@ -18,6 +20,10 @@ from app.agent.sandbox.runner import (
 from common.config import DEFAULT_SANDBOX_PATH
 
 logger = logging.getLogger(__name__)
+
+
+def _elapsed_ms(started_at: float) -> float:
+    return round((perf_counter() - started_at) * 1000, 2)
 
 
 @dataclass(frozen=True)
@@ -149,7 +155,51 @@ class ConfinedSandbox(ABC):
         Raises ``ContainmentError`` when the command's processes may still
         be running, when another command's did while it ran, and for every
         command after that.
+
+        Every call logs one line: ``Command completed``, ``Command failed``,
+        or ``Command cancelled``.
         """
+        # Only the program's name: arguments can carry secrets.
+        fields = {"command": Path(argv[0]).name if argv else "", "sandbox": self.name}
+        started_at = perf_counter()
+        try:
+            result = await self._run(argv, cwd=cwd, timeout=timeout)
+        except asyncio.CancelledError:
+            logger.warning(
+                "Command cancelled",
+                extra={**fields, "duration_ms": _elapsed_ms(started_at)},
+            )
+            raise
+        except Exception as error:
+            failure: dict[str, object] = {"error_type": type(error).__name__}
+            # Only our own messages: others can quote the requested path.
+            if isinstance(error, ContainmentError):
+                failure["reason"] = str(error)
+            logger.warning(
+                "Command failed",
+                extra={**fields, **failure, "duration_ms": _elapsed_ms(started_at)},
+            )
+            raise
+        logger.info(
+            "Command completed",
+            extra={
+                **fields,
+                "exit_code": result.exit_code,
+                "timed_out": result.timed_out,
+                "truncated": result.truncated,
+                "output_bytes": result.output_bytes,
+                "duration_ms": result.duration_ms,
+            },
+        )
+        return result
+
+    async def _run(
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: Path,
+        timeout: float | None,
+    ) -> CommandResult:
         if (refusal := self._refusal()) is not None:
             raise ContainmentError(refusal)
         # A leading "-" would be read as an option by the sandbox launcher.
@@ -169,18 +219,6 @@ class ConfinedSandbox(ABC):
                 sweep=partial(self._sweep, run),
                 stop=self._refusal,
             )
-        logger.info(
-            "Command completed",
-            extra={
-                # Only the program's name: arguments can carry secrets.
-                "command": Path(argv[0]).name,
-                "sandbox": self.name,
-                "exit_code": result.exit_code,
-                "timed_out": result.timed_out,
-                "truncated": result.truncated,
-                "duration_ms": result.duration_ms,
-            },
-        )
         # It may have exited between the runner's checks, after another
         # command's sweep failed; its result can't be trusted either.
         if (refusal := self._refusal()) is not None:
