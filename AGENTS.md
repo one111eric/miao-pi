@@ -43,8 +43,9 @@ Fix formatting with `uv run isort . && uv run black .`.
   `nodes.py` (async node functions), `graph.py` (wiring and compile),
   `service.py` (runs or resumes the graph for a request), `approval.py`
   (pausing for a human before tools with side effects), `workspace.py` (the
-  boundary for project files), and `tools/` (the read-only tools, one module
-  each, plus `tool_utils/` with the shared `files.py` and `output.py`).
+  boundary for project files), `tools/` (the read-only tools, one module
+  each, plus `tool_utils/` with the shared `files.py` and `output.py`), and
+  `sandbox/` (running commands confined to the workspace).
 - `common/` — code shared across features: `config.py` (`SvcSettings`),
   `llm/` (`LLM`, a `ChatOpenAI` subclass), `logging_helper.py`.
 - `tests/unit/` — no network, no app lifespan.
@@ -137,6 +138,78 @@ Tools (`app/agent/tools/`):
   the contents) of an outside directory.
 - `read` stops at the first cap: a cut notice gives the file's size, not its
   line count, because counting would read the whole file.
+
+Command sandbox (`app/agent/sandbox/`, plan and findings in
+`docs/sandbox.md`). Nothing calls it yet; step 6's `run_command` will:
+
+- At startup, `make_sandbox` picks Seatbelt on macOS or bubblewrap on Linux
+  and self-tests it. A plain command runs in the real workspace; the rest
+  runs in a throwaway workspace built the same way, never the real one.
+  There, a write must work, and these must fail: reading or changing a
+  denied `.env`, reading or writing outside, and reaching a localhost
+  listener. It sets `app.state.sandbox` to the sandbox, or to `None` when
+  none works. Any exception while building or testing a backend also
+  means `None`; only a bad `sandbox_read_paths` entry fails startup. There's no unsandboxed mode: without a sandbox, command tools
+  aren't offered. `Startup complete` logs `sandbox` (the backend, `off`, or
+  `unavailable: <reason>`) and `sandbox_read_paths`. No backend at all logs
+  a `Sandbox unavailable` warning (not for `off`), and a self-test that
+  raises logs its traceback.
+- Every `ConfinedSandbox.run` call logs exactly one line: `Command
+  completed` (with `output_bytes`), `Command failed` (`error_type`, plus
+  `reason` only for `ContainmentError`, since other messages can quote the
+  requested path), or `Command cancelled`. Self-test commands carry the
+  context field `sandbox_self_test=True`. Never log argv beyond the
+  program's name, or output.
+- A backend only builds the command line that confines a command
+  (`confine`). `ConfinedSandbox.run` and `runner.run_process` do the rest
+  for every backend:
+  - an environment built from scratch, never inherited;
+  - a fresh run directory (`RunDir`), whose `home/` is `HOME` and `TMPDIR`;
+  - the timeout: `SIGTERM`, then `SIGKILL`, to the whole process group;
+  - killing what the command left running;
+  - keeping the last `sandbox_max_output_bytes` of output.
+- Never `await process.wait()` in the runner: on Python 3.12 and later it
+  waits for the output pipe to close, which a leftover background process
+  can delay forever. Watch `returncode` instead.
+- Seatbelt rules:
+  - Deny by default.
+  - Deny rules must come after the allows, because the last matching rule
+    wins (`test_the_profile_denies_by_default_and_puts_denies_last`).
+  - No `mach-lookup`, and signals only within the sandbox.
+  - `setsid` and `setpgid` are denied with a `syscall-unix` rule, since
+    `(deny default)` doesn't cover system calls.
+  - `posix_spawn`'s `setsid` and `setpgroup` options still leave the group,
+    so after every command `seatbelt_sweep` kills what's left in that
+    command's sandbox. It recognizes a process with the private
+    `sandbox_check`: sandboxed, may read the run's `marker`, may not read
+    its `canary`. Both files sit in the run directory next to `home/` (the
+    scratch directory), where commands can't change them.
+  - The runner's `_end` kills the group, then sweeps once, in a thread,
+    before waiting for output. A cancellation, even a repeated one, waits
+    for the sweep to finish (it must finish before the run directory is
+    removed) and is raised afterwards. Never call a sweep on the event
+    loop thread.
+  - A sweep that can't end everything raises `ContainmentError`, and
+    `ConfinedSandbox._sweep` turns any sweep error into one. The command
+    fails instead of returning a result, and `disabled_reason` makes the
+    sandbox refuse every later command until restart, since what's left can
+    still change the workspace. On the cancel path the cancellation is
+    raised, but the sandbox still turns commands off.
+  - Commands run concurrently, so turning commands off also stops the ones
+    already running: the runner's poll checks `stop`
+    (`ConfinedSandbox._refusal`), and `run` checks once more after
+    `run_process` returns. Don't serialize `run()` with a lock instead;
+    one long command would block every other conversation.
+  - That's detection, not containment: a failed sweep's processes may keep
+    running (still sandboxed). Don't describe it as a guaranteed end.
+  - The self-test plants a sandboxed process in a session of its own and
+    requires the sweep to kill it, so a macOS update that breaks
+    `sandbox_check` turns commands off.
+  - Deny patterns become case-insensitive regexes (`glob_to_regex`), and
+    paths are passed as `-D` parameters.
+- bubblewrap unshares every namespace and, before each command, masks the
+  workspace's existing denied paths using `Workspace.is_denied`. It has
+  unit tests only; it hasn't run on Linux yet.
 
 Run limits (`AgentLimits`, from `agent_max_steps` and `agent_run_timeout`):
 
@@ -284,6 +357,12 @@ change its shape.
 - Unit-test tools by invoking them with a tool-call dict, the way `ToolNode`
   does, so errors come back as `ToolMessage(status="error")` (see `call` in
   `tests/unit/test_read_tools.py`).
+- `tests/conftest.py` sets `SANDBOX_BACKEND=off` for every test, so app
+  startup skips the sandbox self-test. Tests that need a sandbox build one.
+  `UnconfinedSandbox` in `tests/fakes.py` confines nothing and exists only to
+  test process handling; `FakeSandbox` runs nothing and records calls.
+  The opt-in tests against the real backend need
+  `RUN_SANDBOX_TESTS=1 uv run pytest -m sandbox`.
 - `serve(model, root, extra_tools)` in `tests/apps.py` runs the app with its
   lifespan, a given model, and a workspace, when the `client` fixture's
   `EchoChatModel` won't do. `recording_tool(effects)` in `tests/fakes.py` is
@@ -340,6 +419,22 @@ change its shape.
 - With `dev_ui_enabled`, anyone who can reach the server can read any
   thread's history, tool results included. Keep it off outside local
   development until 7b adds authentication and ownership checks.
+- Inside the sandbox, a project's `.env` is unreadable on macOS
+  (`PermissionError`) and empty on Linux. Code that loads `.env`, like this
+  repo's `SvcSettings`, therefore fails sandboxed on macOS: 73 of this
+  repo's tests do.
+- Toolchains installed under the home directory (uv's Python, pyenv, cargo)
+  need their paths in `sandbox_read_paths`; the home directory itself is
+  refused.
+- On macOS, a process started with `posix_spawn`'s `setsid` or `setpgroup`
+  option escapes the group kill; only the sweep ends it. A process that
+  runs as another user (a setuid program) can't be signalled: the command
+  fails with `ContainmentError` and commands stay off until restart. On
+  Linux the PID namespace ends everything.
+- Inside the sandbox a denied-name symlink reaches its target
+  (`.env.link -> notes.txt` reads `notes.txt`), on both backends, though
+  `Workspace.resolve` refuses the name. The deny list protects files where
+  they are; the target is readable under its own name anyway.
 
 ## Rules
 

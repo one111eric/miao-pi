@@ -189,6 +189,8 @@ async def test_startup_builds_workspace_from_settings(
         "private",
     ]
     assert startup.__dict__["workspace_context_max_chars"] == 20_000
+    assert startup.__dict__["sandbox"] == "off"
+    assert startup.__dict__["sandbox_read_paths"] == []
 
     async with app.router.lifespan_context(app):
         assert app.state.workspace.root == tmp_path.resolve()

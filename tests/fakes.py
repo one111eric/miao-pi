@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import Any
 
 from langchain_core.callbacks import (
@@ -14,6 +15,7 @@ from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import Field
 
 from app.agent.approval import REQUIRES_APPROVAL
+from app.agent.sandbox import CommandResult, ConfinedSandbox, RunDir
 
 # Mirrors BaseChatModel.bind_tools, whose signature uses Any.
 type BindableTool = dict[str, Any] | type | Callable[..., Any] | BaseTool
@@ -152,3 +154,42 @@ def recording_tool(effects: list[str]) -> BaseTool:
         description="Record a note. This changes state, so it needs approval.",
         metadata={REQUIRES_APPROVAL: True},
     )
+
+
+class UnconfinedSandbox(ConfinedSandbox):
+    """Runs commands with no confinement at all, to test process handling.
+
+    Only for tests of what every backend shares (environment, timeouts,
+    output); never a stand-in for a real sandbox.
+    """
+
+    name = "unconfined"
+
+    def confine(
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: Path,
+        run: RunDir,
+    ) -> list[str]:
+        return list(argv)
+
+
+class FakeSandbox:
+    """A sandbox that runs nothing: it records each call and returns ``result``."""
+
+    name = "fake"
+
+    def __init__(self, result: CommandResult) -> None:
+        self.result = result
+        self.calls: list[tuple[list[str], Path, float | None]] = []
+
+    async def run(
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: Path,
+        timeout: float | None = None,
+    ) -> CommandResult:
+        self.calls.append((list(argv), cwd, timeout))
+        return self.result

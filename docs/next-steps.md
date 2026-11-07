@@ -20,6 +20,8 @@ langchain-openai 1.7.2, and fastapi 0.149.0.
   `awaiting_approval` with the actions, and
   `POST /threads/{thread_id}/resume` approves or rejects them (step 5a). No
   shipped tool needs it yet.
+- A command sandbox (Seatbelt on macOS, bubblewrap on Linux) is chosen and
+  self-tested at startup, ready for step 6's `run_command` (step 5b).
 - Conversations continue across requests that share a `thread_id`, kept in
   an in-memory checkpointer with a TTL and a thread cap (step 2).
 - A validated workspace boundary rejects escapes and denied paths; project
@@ -429,42 +431,20 @@ through the API.
 
 ## 5b. Command sandbox
 
-**Goal:** commands the agent runs can't reach beyond the workspace, even if
-the command itself is malicious.
+**Status: built (2026-11-05),** with one gap: the bubblewrap backend isn't
+tested on Linux yet. On macOS, a sweep after each command ends processes
+that left its process group, which Seatbelt alone can't prevent. If it
+can't, that's detected: the command fails, running commands are stopped,
+and commands stay off until restart.
 
-**Decisions**
-
-- Container per command (Docker or Podman) or a long-lived sandbox per
-  thread? Recommendation: a container per command with the workspace mounted
-  read-write. It's simplest, and nothing carries over between commands.
-- Is network access needed (installing dependencies)? Recommendation: no
-  network by default, with a per-command opt-in that also requires approval.
-
-**Changes**
-
-- New `app/agent/sandbox.py` with one narrow interface, for example
-  `async run(argv: list[str], timeout: float) -> CommandResult`, so the
-  backend can change later.
-- Container settings:
-  - No network.
-  - Only the workspace mounted, and not `.env` or anything else from the
-    deny list.
-  - A non-root user, a read-only root file system, and CPU, memory, and
-    process limits.
-  - A wall-clock timeout that kills the container.
-- Settings for the image and the limits in `SvcSettings` and `.env.example`.
-- Check at startup that the container runtime is available, or refuse to
-  enable command tools.
-
-**Tests**
-
-- Interface-level tests against a fake backend.
-- Real-container integration tests, opt-in behind an env flag like the live
-  LLM tests: a timeout kills the command; there's no network; files outside
-  the workspace aren't visible; output is captured and capped.
-
-**Done when:** the sandbox passes its opt-in integration tests, and the
-decisions above are written down in `AGENTS.md`.
+Commands the agent runs can't reach beyond the workspace, even if the
+command itself is malicious: no network, writes only inside the workspace,
+reads denied outside it, the deny list enforced, and a clean environment.
+Every command ends within its timeout, or a containment failure is detected
+and reported, with any leftover processes still confined by the sandbox.
+The detailed plan, including the decision to
+use the OS's own sandbox (Seatbelt on macOS, bubblewrap on Linux) rather
+than containers, is in [sandbox.md](sandbox.md).
 
 ---
 
@@ -506,8 +486,9 @@ approve. Before these tools land:
   own: model calls by `llm_timeout` and its retries, tools by their own
   timeouts. Keep a much larger outer `asyncio.timeout` only as a backstop.
 - Every side-effecting tool has a timeout that actually stops the work:
-  commands get the sandbox's wall-clock limit, which kills the container
-  (5b); writes are short and atomic (write a temporary file, then rename).
+  commands get the sandbox's own timeout, which kills the command's whole
+  process tree (5b); writes are short and atomic (write a temporary file,
+  then rename).
 - Make writes safe to repeat where possible: `write_file` writes the whole
   content, and `apply_patch` checks that the file still matches the diff's
   base before applying it. Commands can't be made safe to repeat, which is
@@ -626,8 +607,8 @@ without authentication.
   `workspace_context_max_chars`. Load it inside `react` instead. Don't use
   `UntrackedValue`: a run resumed after a 5a approval continues at `react`
   without rerunning `preplanning`, so it would have no context.
-- A Dockerfile for the service itself, separate from the command sandbox
-  image.
+- A Dockerfile for the service itself, and a container backend for the
+  command sandbox inside it (see "Later" in [sandbox.md](sandbox.md)).
 - A run configuration with settings from the environment, and health checks
   wired to `/health`.
 

@@ -122,7 +122,7 @@ as they are. The API they call is the hard part, and needs:
 - Authentication (7b). A hosted page means a publicly reachable API, and
   without a token anyone could read the workspace through the agent.
 - An HTTPS deployment of the API (step 8). It can't run on Cloudflare
-  Workers: it needs a real file system and, from 5b, containers. Cloudflare
+  Workers: it needs a real file system and, from 5b, an OS sandbox. Cloudflare
   Tunnel is one way to expose it.
 - A setting listing the page origins allowed by CORS on the agent routes.
   Never `*`.
