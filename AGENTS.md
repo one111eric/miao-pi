@@ -184,12 +184,18 @@ Command sandbox (`app/agent/sandbox/`, plan and findings in
   `unavailable: <reason>`) and `sandbox_read_paths`. No backend at all logs
   a `Sandbox unavailable` warning (not for `off`), and a self-test that
   raises logs its traceback.
-- Every `ConfinedSandbox.run` call logs exactly one line: `Command
-  completed` (with `output_bytes`), `Command failed` (`error_type`, plus
-  `reason` only for `ContainmentError`, since other messages can quote the
-  requested path), or `Command cancelled`. Self-test commands carry the
-  context field `sandbox_self_test=True`. Never log argv beyond the
-  program's name, or output.
+- Every `ConfinedSandbox.run` call logs `Command started` with its effective
+  timeout, then one terminal event: `Command completed`, `Command timed out`,
+  `Command failed`, or `Command cancelled`. Timeouts, failures, and cancellation
+  are warnings; normal completion includes exit code and output size.
+  A unique `command_id` context field links all runner and cleanup logs, and
+  `tool_call_id` links agent tool logs to approvals. Self-test commands carry
+  `sandbox_self_test=True`. Never log argv beyond the program's name, or output.
+- Approval refusals log `Tool call refused` with a safe reason code
+  (`invalid_arguments`, `path_rejected`, `approval_rejected`, or
+  `approval_missing`), without argument values or rejection notes. A failed
+  Seatbelt sweep logs `Process cleanup incomplete` with counts; successful
+  cleanup of escaped processes is reported only when the sweep succeeds.
 - A backend only builds the command line that confines a command
   (`confine`). `ConfinedSandbox.run` and `runner.run_process` do the rest
   for every backend:

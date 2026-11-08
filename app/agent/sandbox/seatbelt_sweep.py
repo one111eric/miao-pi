@@ -174,17 +174,25 @@ def end_run_processes(run_dir: Path, pgid: int) -> None:
     else:
         # The last pass's kills haven't been checked yet.
         remaining = left()
-    if escaped:
-        logger.warning(
-            "Ended processes that left the command's process group",
-            extra={"count": len(escaped)},
-        )
     problems = []
     if unkillable:
         problems.append(f"{len(unkillable)} can't be signalled")
     if remaining:
         problems.append(f"{len(remaining)} outlasted {MAX_PASSES} passes")
     if problems:
+        logger.error(
+            "Process cleanup incomplete",
+            extra={
+                "escaped_count": len(escaped),
+                "unkillable_count": len(unkillable),
+                "remaining_count": len(remaining),
+            },
+        )
         raise ContainmentError(
             f"the command left processes running: {', '.join(problems)}"
+        )
+    if escaped:
+        logger.warning(
+            "Ended processes that left the command's process group",
+            extra={"count": len(escaped)},
         )

@@ -301,6 +301,7 @@ async def test_rejected_command_does_not_reach_the_sandbox(tmp_path: Path) -> No
 @pytest.mark.anyio
 async def test_invalid_command_is_rejected_without_asking_for_approval(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     sandbox = FakeSandbox(CommandResult(0, "", False, 0, False, 0))
     command = make_command_tool(Workspace(tmp_path), sandbox)
@@ -321,6 +322,9 @@ async def test_invalid_command_is_rejected_without_asking_for_approval(
         last_tool_result(model.calls[1]).content
         == "Not run: Invalid command arguments: argv must be a non-empty array."
     )
+    [refused] = [r for r in caplog.records if r.message == "Tool call refused"]
+    assert refused.__dict__["reason"] == "invalid_arguments"
+    assert refused.__dict__["tool"] == "run_command"
 
 
 @pytest.mark.anyio

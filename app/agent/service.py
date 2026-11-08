@@ -205,6 +205,9 @@ async def resume_agent(
                 extra={
                     "approved": request.approved,
                     "pending_tools": [action.tool for action in actions],
+                    "pending_tool_call_ids": [
+                        action.tool_call_id for action in actions
+                    ],
                 },
             )
             decision: ApprovalDecision = {

@@ -9,6 +9,7 @@ from app.agent.graph import build_agent_graph
 from app.agent.nodes import STEP_LIMIT_MESSAGE
 from app.agent.service import AgentLimits
 from app.agent.threads import ThreadStore
+from common.logging_helper import RequestFormatter
 from tests.apps import serve
 from tests.fakes import EchoChatModel, ScriptedChatModel, recording_tool, tool_call
 
@@ -69,9 +70,13 @@ async def test_a_tool_that_needs_approval_pauses_the_run(
 async def test_approving_runs_the_tool_and_finishes_the_run(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     effects: list[str] = []
     model = record_then_answer()
+    monkeypatch.setattr(
+        caplog.handler, "formatter", RequestFormatter("%(context)s%(message)s")
+    )
 
     async with serve(model, tmp_path, [recording_tool(effects)]) as (_, client):
         await client.post("/invoke", json={"message": "Note hello", "thread_id": "t1"})
@@ -92,10 +97,15 @@ async def test_approving_runs_the_tool_and_finishes_the_run(
     decision = log_record(caplog, "Approval decision received")
     assert decision.__dict__["approved"] is True
     assert decision.__dict__["pending_tools"] == ["record"]
+    assert decision.__dict__["pending_tool_call_ids"] == ["call-1"]
+    completed = log_record(caplog, "Tool call completed")
+    assert "tool_call_id=call-1" in completed.__dict__["context"]
 
 
 @pytest.mark.anyio
-async def test_rejecting_skips_the_tool_and_tells_the_model(tmp_path: Path) -> None:
+async def test_rejecting_skips_the_tool_and_tells_the_model(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     effects: list[str] = []
     model = record_then_answer()
 
@@ -113,6 +123,9 @@ async def test_rejecting_skips_the_tool_and_tells_the_model(tmp_path: Path) -> N
     assert result.content == (
         "Not run: the user rejected this action. Their note: Not today."
     )
+    refused = log_record(caplog, "Tool call refused")
+    assert refused.__dict__["reason"] == "approval_rejected"
+    assert "Not today" not in caplog.text
 
 
 @pytest.mark.anyio
@@ -209,7 +222,9 @@ async def test_history_lists_the_pending_actions(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
-async def test_the_tools_node_refuses_a_call_with_no_approval(tmp_path: Path) -> None:
+async def test_the_tools_node_refuses_a_call_with_no_approval(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     effects: list[str] = []
     model = record_then_answer()
 
@@ -228,6 +243,8 @@ async def test_the_tools_node_refuses_a_call_with_no_approval(tmp_path: Path) ->
     assert result.content == (
         "Not run: this action needs a human's approval, and none was given."
     )
+    refused = log_record(caplog, "Tool call refused")
+    assert refused.__dict__["reason"] == "approval_missing"
 
 
 @pytest.mark.anyio

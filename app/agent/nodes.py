@@ -19,6 +19,7 @@ from app.agent.workspace import (
     WorkspaceAccessError,
     WorkspaceError,
 )
+from common.logging_helper import logging_context
 
 logger = logging.getLogger(__name__)
 
@@ -263,6 +264,11 @@ async def log_tool_call(
     execute: ToolExecutor,
 ) -> ToolResult:
     """Log each tool call's name, outcome, and duration, never its output."""
+    with logging_context(tool_call_id=request.tool_call["id"]):
+        return await _log_tool_call(request, execute)
+
+
+async def _log_tool_call(request: ToolCallRequest, execute: ToolExecutor) -> ToolResult:
     started_at = perf_counter()
     tool_name = request.tool_call["name"]
     try:

@@ -188,6 +188,15 @@ def make_approval_gate(
             return await execute(request)
         call_id = request.tool_call["id"]
         if failure := _preflight_error(request.tool_call, checks):
+            logger.warning(
+                "Tool call refused",
+                extra={
+                    "tool": name,
+                    "reason": (
+                        "path_rejected" if failure.reason else "invalid_arguments"
+                    ),
+                },
+            )
             if failure.reason is not None:
                 logger.warning(
                     "Tool path rejected",
@@ -207,6 +216,15 @@ def make_approval_gate(
         decision = state.get("approvals", {}).get(call_id)
         if decision is not None and decision["approved"]:
             return await execute(request)
+        logger.warning(
+            "Tool call refused",
+            extra={
+                "tool": name,
+                "reason": (
+                    "approval_missing" if decision is None else "approval_rejected"
+                ),
+            },
+        )
         return ToolMessage(
             content=rejection_text(decision),
             tool_call_id=call_id or "",
