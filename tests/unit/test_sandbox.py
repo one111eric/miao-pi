@@ -35,7 +35,7 @@ from app.agent.sandbox.seatbelt import (
 )
 from app.agent.workspace import Workspace, WorkspaceAccessError
 from common.config import SandboxBackend, SvcSettings
-from common.logging_helper import LOGGING_FORMAT, RequestFormatter
+from common.logging_helper import LOGGING_FORMAT, RequestFormatter, logging_context
 from tests.fakes import FakeSandbox, UnconfinedSandbox
 
 
@@ -264,7 +264,7 @@ def test_the_sweep_ends_only_this_runs_processes(
 
 
 def test_the_sweep_fails_when_a_process_cant_be_signalled(
-    tmp_path: Path, processes: FakeProcesses
+    tmp_path: Path, processes: FakeProcesses, caplog: pytest.LogCaptureFixture
 ) -> None:
     marker = os.fsencode(tmp_path / "marker")
     processes.add(10, sandboxed=True, reads={marker}, pgid=10)
@@ -275,6 +275,10 @@ def test_the_sweep_fails_when_a_process_cant_be_signalled(
         seatbelt_sweep.end_run_processes(tmp_path, pgid=10)
 
     assert processes.killed == [10]
+    assert "Ended processes" not in caplog.text
+    [failure] = [r for r in caplog.records if r.message == "Process cleanup incomplete"]
+    assert failure.levelno == logging.ERROR
+    assert getattr(failure, "unkillable_count") == 1
 
 
 def test_the_sweep_fails_when_a_fork_loop_outlasts_it(
@@ -732,7 +736,12 @@ async def test_the_fake_sandbox_records_calls(root: Path) -> None:
 
 # Logging
 
-COMMAND_LOGS = {"Command completed", "Command failed", "Command cancelled"}
+COMMAND_LOGS = {
+    "Command completed",
+    "Command timed out",
+    "Command failed",
+    "Command cancelled",
+}
 
 
 def command_logs(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
@@ -755,6 +764,19 @@ async def test_a_completed_command_logs_its_full_output_size(
     assert getattr(record, "command") == "printf"
     assert getattr(record, "truncated") is True
     assert getattr(record, "output_bytes") == 26
+
+
+@pytest.mark.anyio
+async def test_a_command_timeout_logs_a_warning(
+    root: Path, unconfined: UnconfinedSandbox, caplog: pytest.LogCaptureFixture
+) -> None:
+    await unconfined.run(["/bin/sleep", "60"], cwd=root, timeout=0.01)
+
+    [record] = command_logs(caplog)
+    assert record.message == "Command timed out"
+    assert record.levelno == logging.WARNING
+    assert getattr(record, "timed_out") is True
+    assert getattr(record, "timeout_seconds") == 0.01
 
 
 @pytest.mark.anyio
@@ -809,6 +831,42 @@ class ContextLines(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         self.lines.append(self.format(record))
+
+
+@pytest.mark.anyio
+async def test_concurrent_commands_have_distinct_ids_and_keep_tool_context(
+    root: Path, unconfined: UnconfinedSandbox
+) -> None:
+    handler = ContextLines()
+    logger = logging.getLogger("app.agent.sandbox")
+    previous_level = logger.level
+    logger.setLevel(logging.INFO)
+    logger.addHandler(handler)
+    try:
+        with logging_context(tool_call_id="tool-1"):
+            await asyncio.gather(
+                unconfined.run(["printf", "secret-output-one"], cwd=root),
+                unconfined.run(["printf", "secret-output-two"], cwd=root),
+            )
+        await unconfined.run(["true"], cwd=root)
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+
+    paired: dict[str, list[str]] = {}
+    for line in handler.lines[:4]:
+        assert "tool_call_id=tool-1" in line
+        assert "secret-output" not in line
+        match = re.search(r"command_id=([\w-]+)", line)
+        assert match is not None
+        paired.setdefault(match[1], []).append(line)
+    assert len(paired) == 2
+    for lines in paired.values():
+        assert len(lines) == 2
+        assert "msg=Command started" in lines[0]
+        assert "timeout_seconds=120" in lines[0]
+        assert "msg=Command completed" in lines[1]
+    assert all("tool_call_id=" not in line for line in handler.lines[4:])
 
 
 @pytest.mark.anyio

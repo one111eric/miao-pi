@@ -16,6 +16,8 @@ class AgentState(TypedDict):
     context: NotRequired[str]
     # The human's decision for each pending tool call, keyed by tool call id.
     approvals: NotRequired[dict[str, ApprovalDecision]]
+    # Monotonic deadline for this invocation; refreshed after an approval.
+    deadline: NotRequired[float]
     # Filled in by LangGraph from the run's recursion limit; never saved.
     remaining_steps: NotRequired[RemainingSteps]
 
@@ -26,6 +28,7 @@ class AgentUpdate(TypedDict, total=False):
     messages: list[AnyMessage]
     context: str
     approvals: dict[str, ApprovalDecision]
+    deadline: float
 
 
 class AgentNode(Protocol):

@@ -13,12 +13,21 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 
 from app.agent.graph import build_agent_graph
-from app.agent.nodes import INTERRUPTED_TOOL_RESULT, STEP_LIMIT_MESSAGE
+from app.agent.nodes import STEP_LIMIT_MESSAGE, TIME_LIMIT_MESSAGE
+from app.agent.sandbox import CommandResult
+from app.agent.sandbox.startup import SandboxSetup
 from app.agent.service import AgentLimits
 from app.agent.tools import make_read_tools
 from app.agent.workspace import Workspace
+from common.config import SvcSettings
 from tests.apps import serve
-from tests.fakes import EchoChatModel, ScriptedChatModel, tool_call
+from tests.fakes import (
+    EchoChatModel,
+    FakeSandbox,
+    GatedChatModel,
+    ScriptedChatModel,
+    tool_call,
+)
 
 
 def log_record(caplog: pytest.LogCaptureFixture, message: str) -> logging.LogRecord:
@@ -50,11 +59,37 @@ class AlwaysCallsTools(BaseChatModel):
 
 
 @pytest.mark.anyio
-async def test_startup_binds_the_read_only_tools(
+async def test_startup_binds_the_workspace_tools(
     echo_model: EchoChatModel, client: AsyncClient
 ) -> None:
     del client
-    assert echo_model.bound_tools == ["read", "ls", "find", "grep"]
+    assert echo_model.bound_tools == [
+        "read",
+        "ls",
+        "find",
+        "grep",
+        "write_file",
+        "apply_patch",
+    ]
+
+
+@pytest.mark.anyio
+async def test_startup_binds_command_tool_when_sandbox_is_available(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = EchoChatModel()
+    sandbox = FakeSandbox(CommandResult(0, "", False, 0, False, 0))
+
+    async def sandbox_ready(
+        settings: SvcSettings, workspace: Workspace
+    ) -> SandboxSetup:
+        return SandboxSetup(sandbox, "fake")
+
+    monkeypatch.setattr("app.service.make_sandbox", sandbox_ready)
+
+    async with serve(model, tmp_path) as (app, _):
+        assert app.state.sandbox is sandbox
+        assert "run_command" in model.bound_tools
 
 
 @pytest.mark.anyio
@@ -179,12 +214,12 @@ async def test_the_step_limit_ends_the_run_with_a_valid_history(
 @tool
 async def slow() -> str:
     """Takes longer than the run is allowed."""
-    await asyncio.sleep(10)
+    await asyncio.sleep(0.3)
     return "done"
 
 
 @pytest.mark.anyio
-async def test_a_timed_out_run_returns_504_and_its_thread_recovers(
+async def test_a_run_stops_between_steps_after_its_deadline(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -208,20 +243,40 @@ async def test_a_timed_out_run_returns_504_and_its_thread_recovers(
             "/invoke", json={"message": "Try again", "thread_id": "slow"}
         )
 
-    assert timed_out.status_code == 504
-    assert timed_out.json() == {"detail": "Agent run timed out"}
-    assert (
-        log_record(caplog, "Agent run timed out").__dict__["agent_run_timeout"] == 0.2
-    )
+    assert timed_out.status_code == 200
+    assert timed_out.json()["response"] == TIME_LIMIT_MESSAGE
+    assert log_record(caplog, "Agent time limit reached")
     assert recovered.status_code == 200
     assert recovered.json()["response"] == "Recovered."
-    # The unanswered call gets a placeholder result, so providers accept the history.
+    # The slow tool completed before the graph stopped, so its known result is
+    # saved rather than an ambiguous placeholder.
     sent = [(type(m).__name__, m.text) for m in model.calls[1][1:]]
     assert sent == [
         ("HumanMessage", "Be slow"),
         ("AIMessage", ""),
-        ("ToolMessage", INTERRUPTED_TOOL_RESULT),
+        ("ToolMessage", "done"),
+        ("AIMessage", TIME_LIMIT_MESSAGE),
         ("HumanMessage", "Try again"),
     ]
-    # The call may have finished in its worker thread after the timeout.
-    assert "may or may not have run" in INTERRUPTED_TOOL_RESULT
+
+
+@pytest.mark.anyio
+async def test_a_final_model_answer_is_kept_when_it_finishes_after_the_deadline(
+    tmp_path: Path,
+) -> None:
+    model = GatedChatModel()
+
+    async with serve(model, tmp_path) as (app, client):
+        app.state.agent_limits = AgentLimits(
+            max_steps=25, run_timeout=0.01, backstop_timeout=1
+        )
+        request = asyncio.create_task(
+            client.post("/invoke", json={"message": "Preserve this answer"})
+        )
+        await asyncio.wait_for(model.started.wait(), timeout=1)
+        await asyncio.sleep(0.02)
+        model.release.set()
+        response = await request
+
+    assert response.status_code == 200
+    assert response.json()["response"] == "Received: Preserve this answer"

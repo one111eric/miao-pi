@@ -254,12 +254,16 @@ class SandboxPolicy:
 - **Output cap:** read in chunks and keep only the last
   `sandbox_max_output_bytes` in memory (a bounded buffer), so a command that
   prints gigabytes can't exhaust memory. Decode as UTF-8 with replacement.
-- **Logging:** one line per call to `run`, whatever happened, each with
-  `command` (only `argv[0]`'s base name), `sandbox`, and `duration_ms`:
+- **Logging:** each call to `run` logs `Command started` with `command`
+  (only `argv[0]`'s base name), `sandbox`, and `timeout_seconds`, followed by
+  one terminal event with `duration_ms`. All command and cleanup logs share
+  a unique `command_id`; calls from the agent also carry `tool_call_id`:
   - `Command completed` (info) adds `exit_code`, `timed_out`, `truncated`,
     and `output_bytes`, everything the command wrote including what was
     cut. `CommandResult.output_bytes` carries the same number for step 6's
     truncation notice.
+  - `Command timed out` (warning) carries the same result fields as completion,
+    so warning-level monitoring can detect timeouts.
   - `Command failed` (warning) adds `error_type`. Only a `ContainmentError`
     adds its message as `reason`: other errors' messages can quote the
     requested path. That covers a command whose own sweep failed, one
@@ -269,6 +273,9 @@ class SandboxPolicy:
     the run timeout, and the command was killed without a result.
   - The self-test's commands log the same lines, marked with the context
     field `sandbox_self_test=True`.
+  - A Seatbelt cleanup failure logs `Process cleanup incomplete` (error) with
+    escaped, unkillable, and remaining process counts. The successful cleanup
+    message is emitted only after the sweep has confirmed success.
 
   Never the full argv, which can carry secrets the user typed, and never the
   output, as with the read tools.
@@ -455,8 +462,9 @@ Runs `bwrap <args…> -- <argv…>` with:
 
 ### How step 6 uses it
 
-- **Approval card:** `run_command(argv, cwd?)` requires approval (5a). The
-  card shows the exact argv, the working directory, and the timeout.
+- **Approval card:** `run_command(argv)` requires approval (5a). The card
+  shows the exact argv. Commands use the configured workspace root and
+  `sandbox_command_timeout`; neither is an argument displayed in the card.
 - **Results:** a `CommandResult` becomes the tool result: the exit code (or
   "killed after 120s"), the output tail, and a notice when it was cut. A
   `ContainmentError` becomes an error result saying commands are off until

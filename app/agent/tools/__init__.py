@@ -9,10 +9,13 @@ the project root, `find` and `grep` run in Python so the deny list and
 
 from langchain_core.tools import BaseTool
 
+from app.agent.sandbox import Sandbox
+from app.agent.tools.command import make_command_tool
 from app.agent.tools.find import make_find_tool
 from app.agent.tools.grep import make_grep_tool
 from app.agent.tools.ls import make_ls_tool
 from app.agent.tools.read import make_read_tool
+from app.agent.tools.write import make_write_tools
 from app.agent.workspace import Workspace
 
 
@@ -24,3 +27,13 @@ def make_read_tools(workspace: Workspace) -> list[BaseTool]:
         make_find_tool(workspace),
         make_grep_tool(workspace),
     ]
+
+
+def make_agent_tools(
+    workspace: Workspace, sandbox: Sandbox | None = None
+) -> list[BaseTool]:
+    """Create every currently implemented agent tool for one workspace."""
+    tools = [*make_read_tools(workspace), *make_write_tools(workspace)]
+    if sandbox is not None:
+        tools.append(make_command_tool(workspace, sandbox))
+    return tools

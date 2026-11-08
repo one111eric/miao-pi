@@ -9,6 +9,7 @@ from functools import partial
 from pathlib import Path
 from time import perf_counter
 from typing import ClassVar, Protocol
+from uuid import uuid4
 
 from app.agent.sandbox.policy import SandboxPolicy
 from app.agent.sandbox.runner import (
@@ -18,6 +19,7 @@ from app.agent.sandbox.runner import (
     run_process,
 )
 from common.config import DEFAULT_SANDBOX_PATH
+from common.logging_helper import logging_context
 
 logger = logging.getLogger(__name__)
 
@@ -156,12 +158,23 @@ class ConfinedSandbox(ABC):
         be running, when another command's did while it ran, and for every
         command after that.
 
-        Every call logs one line: ``Command completed``, ``Command failed``,
-        or ``Command cancelled``.
+        Every call logs a start event and one terminal event, with a unique
+        command id shared by runner and cleanup logs.
         """
+        with logging_context(command_id=str(uuid4())):
+            return await self._run_logged(argv, cwd=cwd, timeout=timeout)
+
+    async def _run_logged(
+        self, argv: Sequence[str], *, cwd: Path, timeout: float | None
+    ) -> CommandResult:
         # Only the program's name: arguments can carry secrets.
-        fields = {"command": Path(argv[0]).name if argv else "", "sandbox": self.name}
+        fields = {
+            "command": Path(argv[0]).name if argv else "",
+            "sandbox": self.name,
+            "timeout_seconds": self.settings.timeout if timeout is None else timeout,
+        }
         started_at = perf_counter()
+        logger.info("Command started", extra=fields)
         try:
             result = await self._run(argv, cwd=cwd, timeout=timeout)
         except asyncio.CancelledError:
@@ -180,8 +193,9 @@ class ConfinedSandbox(ABC):
                 extra={**fields, **failure, "duration_ms": _elapsed_ms(started_at)},
             )
             raise
-        logger.info(
-            "Command completed",
+        logger.log(
+            logging.WARNING if result.timed_out else logging.INFO,
+            "Command timed out" if result.timed_out else "Command completed",
             extra={
                 **fields,
                 "exit_code": result.exit_code,

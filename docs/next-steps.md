@@ -18,10 +18,11 @@ langchain-openai 1.7.2, and fastapi 0.149.0.
   and tool calls, backed by `GET /threads/{thread_id}/messages` (step 4b).
 - Tools marked as needing approval pause the run; `/invoke` returns
   `awaiting_approval` with the actions, and
-  `POST /threads/{thread_id}/resume` approves or rejects them (step 5a). No
-  shipped tool needs it yet.
+  `POST /threads/{thread_id}/resume` approves or rejects them (step 5a).
+  The write and command tools require approval.
 - A command sandbox (Seatbelt on macOS, bubblewrap on Linux) is chosen and
-  self-tested at startup, ready for step 6's `run_command` (step 5b).
+  self-tested at startup; when available, it powers the approval-gated
+  `run_command` tool (steps 5b and 6).
 - Conversations continue across requests that share a `thread_id`, kept in
   an in-memory checkpointer with a TTL and a thread cap (step 2).
 - A validated workspace boundary rejects escapes and denied paths; project
@@ -506,6 +507,15 @@ approve. Before these tools land:
 - Rejecting the write leaves the file unchanged.
 - A run that passes its deadline while an approved tool runs still saves the
   tool's result, and the next turn shows it.
+
+**Status: done (2026-11-08).** `write_file` and `apply_patch` use
+`Workspace`, require approval, and validate denied paths before approval.
+`run_command` requires approval, accepts a bounded argv array without invoking
+a shell automatically (an explicitly requested shell can interpret syntax),
+executes only through a self-tested sandbox, and is not
+registered when no sandbox is available. Its bounded output records the exit
+code or timeout. The run deadline stops the graph between steps, with a
+larger cancellation backstop.
 
 **Done when:** the scripted run passes, and neither tool can act without
 approval.

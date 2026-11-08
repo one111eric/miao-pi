@@ -1,3 +1,4 @@
+import stat
 from pathlib import Path
 
 import pytest
@@ -190,3 +191,69 @@ def test_open_file_names_a_directory(tmp_path: Path) -> None:
     with pytest.raises(IsADirectoryError):
         with Workspace(tmp_path).open_file("src"):
             pass
+
+
+def test_write_and_remove_primitives_replace_regular_files(tmp_path: Path) -> None:
+    target = tmp_path / "notes.txt"
+    target.write_text("old", encoding="utf-8")
+    target.chmod(0o640)
+    workspace = Workspace(tmp_path)
+
+    assert workspace.write_text_atomic("notes.txt", "new\n") == target
+    assert target.read_text(encoding="utf-8") == "new\n"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o640
+    assert workspace.remove_file("notes.txt") == target
+    assert not target.exists()
+
+
+def test_write_primitives_reject_a_leaf_symlink(tmp_path: Path) -> None:
+    target = tmp_path / "target.txt"
+    target.write_text("original", encoding="utf-8")
+    (tmp_path / "alias.txt").symlink_to(target.name)
+    workspace = Workspace(tmp_path)
+
+    with pytest.raises(WorkspaceError, match="symbolic link"):
+        workspace.write_text_atomic("alias.txt", "changed")
+    with pytest.raises(WorkspaceError, match="symbolic link"):
+        workspace.remove_file("alias.txt")
+
+    assert target.read_text(encoding="utf-8") == "original"
+    assert (tmp_path / "alias.txt").is_symlink()
+
+
+def test_transaction_applies_replacements_and_deletions(tmp_path: Path) -> None:
+    (tmp_path / "one.txt").write_text("one", encoding="utf-8")
+    (tmp_path / "two.txt").write_text("two", encoding="utf-8")
+    workspace = Workspace(tmp_path)
+
+    changed = workspace.write_text_transaction(
+        [("one.txt", "first"), ("new.txt", "new"), ("two.txt", None)]
+    )
+
+    assert changed == [tmp_path / "one.txt", tmp_path / "new.txt", tmp_path / "two.txt"]
+    assert (tmp_path / "one.txt").read_text(encoding="utf-8") == "first"
+    assert (tmp_path / "new.txt").read_text(encoding="utf-8") == "new"
+    assert not (tmp_path / "two.txt").exists()
+
+
+def test_write_refuses_a_parent_swapped_to_a_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "workspace"
+    (root / "sub").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    workspace = Workspace(root)
+    check = workspace.resolve
+
+    def check_then_swap(path: str | Path = ".") -> Path:
+        resolved = check(path)
+        (root / "sub").rename(tmp_path / "moved")
+        (root / "sub").symlink_to(outside, target_is_directory=True)
+        return resolved
+
+    monkeypatch.setattr(workspace, "resolve", check_then_swap)
+
+    with pytest.raises(WorkspaceError, match="path changed while opening"):
+        workspace.write_text_atomic("sub/notes.txt", "safe")
+    assert not (outside / "notes.txt").exists()

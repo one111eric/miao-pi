@@ -11,6 +11,7 @@ from langgraph.prebuilt.tool_node import ToolCallRequest
 from app.agent.approval import (
     ToolExecutor,
     ToolResult,
+    approval_preflights,
     approval_tool_names,
     make_approval_gate,
     make_approve,
@@ -55,7 +56,8 @@ def build_agent_graph(
     graph_builder.add_edge("preplanning", "react")
     if tools:
         approval_tools = approval_tool_names(tools)
-        gate = make_approval_gate(approval_tools)
+        preflights = approval_preflights(tools)
+        gate = make_approval_gate(approval_tools, preflights)
 
         async def wrap_tool_call(
             request: ToolCallRequest, execute: ToolExecutor
@@ -65,11 +67,11 @@ def build_agent_graph(
         graph_builder.add_node("tools", ToolNode(tools, awrap_tool_call=wrap_tool_call))
         next_nodes = ["tools", "finalize"]
         if approval_tools:
-            graph_builder.add_node("approve", make_approve(approval_tools))
+            graph_builder.add_node("approve", make_approve(approval_tools, preflights))
             graph_builder.add_edge("approve", "tools")
             next_nodes.append("approve")
         graph_builder.add_conditional_edges(
-            "react", make_route_after_react(approval_tools), next_nodes
+            "react", make_route_after_react(approval_tools, preflights), next_nodes
         )
         graph_builder.add_edge("tools", "react")
     else:

@@ -36,6 +36,8 @@ class AgentLimits:
 
     max_steps: int
     run_timeout: float
+    # Only a last-resort cancellation after the normal deadline lets a step end.
+    backstop_timeout: float = 60
 
 
 class AgentRunTimeoutError(Exception):
@@ -85,7 +87,7 @@ async def _run(
     config: RunnableConfig,
     limits: AgentLimits,
 ) -> dict[str, Any]:
-    deadline = asyncio.timeout(limits.run_timeout)
+    deadline = asyncio.timeout(limits.run_timeout + limits.backstop_timeout)
     try:
         async with deadline:
             # The graph's state is a TypedDict, but ainvoke returns a plain dict
@@ -98,10 +100,14 @@ async def _run(
             raise
         logger.warning(
             "Agent run timed out",
-            extra={"agent_run_timeout": limits.run_timeout},
+            extra={"agent_run_timeout": limits.run_timeout + limits.backstop_timeout},
         )
         raise AgentRunTimeoutError(limits.run_timeout) from error
     return result
+
+
+def _deadline(limits: AgentLimits) -> float:
+    return asyncio.get_running_loop().time() + limits.run_timeout
 
 
 def _response(thread_id: str, result: dict[str, Any]) -> AgentResponse:
@@ -165,7 +171,10 @@ async def invoke_agent(
                     raise ThreadAwaitingApprovalError(thread_id)
             result = await _run(
                 graph,
-                {"messages": [HumanMessage(content=request.message)]},
+                {
+                    "messages": [HumanMessage(content=request.message)],
+                    "deadline": _deadline(limits),
+                },
                 config,
                 limits,
             )
@@ -196,13 +205,21 @@ async def resume_agent(
                 extra={
                     "approved": request.approved,
                     "pending_tools": [action.tool for action in actions],
+                    "pending_tool_call_ids": [
+                        action.tool_call_id for action in actions
+                    ],
                 },
             )
             decision: ApprovalDecision = {
                 "approved": request.approved,
                 "note": request.note,
             }
-            result = await _run(graph, Command(resume=decision), config, limits)
+            result = await _run(
+                graph,
+                Command(resume=decision, update={"deadline": _deadline(limits)}),
+                config,
+                limits,
+            )
         return _response(thread_id, result)
 
 

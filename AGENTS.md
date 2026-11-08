@@ -43,8 +43,8 @@ Fix formatting with `uv run isort . && uv run black .`.
   `nodes.py` (async node functions), `graph.py` (wiring and compile),
   `service.py` (runs or resumes the graph for a request), `approval.py`
   (pausing for a human before tools with side effects), `workspace.py` (the
-  boundary for project files), `tools/` (the read-only tools, one module
-  each, plus `tool_utils/` with the shared `files.py` and `output.py`), and
+  boundary for project files), `tools/` (read and approval-gated write tools,
+  one module each, plus `tool_utils/` with shared read helpers), and
   `sandbox/` (running commands confined to the workspace).
 - `common/` — code shared across features: `config.py` (`SvcSettings`),
   `llm/` (`LLM`, a `ChatOpenAI` subclass), `logging_helper.py`.
@@ -88,6 +88,14 @@ Approval (`app/agent/approval.py`):
   `ToolMessage` (`rejection_text`), so a routing bug fails closed. Rejected
   calls reach the model as that error result; other calls in the same
   response run normally.
+- A tool may set an `APPROVAL_PREFLIGHT` callback for side-effect-free
+  validation. A failed preflight becomes an error result without asking for
+  approval. Its structured failure carries the rejected path and (for a
+  boundary rejection) its reason for safe logging. Results are cached by
+  tool arguments for the graph's lifetime, so routing, interrupt creation,
+  and the gate agree without repeating expensive checks; the tool still
+  revalidates its workspace boundary when it executes because the filesystem
+  can change while approval is pending.
 - The interrupt lives in its own node rather than inside each tool: on
   resume LangGraph reruns the whole interrupted node, and `ToolNode` would
   rerun every call in it.
@@ -123,6 +131,28 @@ Tools (`app/agent/tools/`):
   instead of running `fd`/`rg`, so the deny list and `.gitignore` (via
   `pathspec`) apply exactly. Denied and escaping entries are hidden, not
   reported.
+- `make_write_tools(workspace)` builds `write_file` and `apply_patch`.
+  `make_command_tool(workspace, sandbox)` builds `run_command`, and
+  `make_agent_tools(workspace, sandbox)` combines it with the read and write
+  tools only when startup supplied a self-tested sandbox. All three require
+  approval. `write_file` atomically replaces one UTF-8 text
+  file, rejects NUL bytes, caps input at 1,000,000 characters, and requires
+  its parent directory to exist. Both write primitives reject a leaf symlink
+  rather than replacing its target. `apply_patch` has the same cap, accepts a
+  conservative text-only unified diff (no renames or missing final newlines),
+  rejects NUL-containing sources, checks every hunk's base, and stages all
+  changes so an I/O failure restores earlier files. Neither tool accepts
+  denied or outside paths.
+- Multi-file patch commits use two renames per existing file (original to a
+  backup, then staged replacement into place). A normal I/O failure rolls
+  back, but process death in that small window can leave a destination absent;
+  this is not crash-safe transaction durability.
+- `run_command` receives a non-empty argv array and does not invoke a shell
+  automatically; an explicit shell can interpret shell syntax. It
+  runs from the workspace root, and reuses the sandbox's timeout and bounded
+  output. Its result states the exit code or timeout and whether output was
+  truncated. Invalid argv is rejected before approval; sandbox setup failure
+  or a disabled sandbox means this tool is not registered at all.
 - `Workspace.open_file` is the only way to read file contents. It walks
   from the root one component at a time, each opened relative to its parent
   (`dir_fd`) with `O_NOFOLLOW`, so a symlink swapped in anywhere along the
@@ -140,7 +170,7 @@ Tools (`app/agent/tools/`):
   line count, because counting would read the whole file.
 
 Command sandbox (`app/agent/sandbox/`, plan and findings in
-`docs/sandbox.md`). Nothing calls it yet; step 6's `run_command` will:
+`docs/sandbox.md`) powers step 6's approval-gated `run_command` tool:
 
 - At startup, `make_sandbox` picks Seatbelt on macOS or bubblewrap on Linux
   and self-tests it. A plain command runs in the real workspace; the rest
@@ -154,12 +184,18 @@ Command sandbox (`app/agent/sandbox/`, plan and findings in
   `unavailable: <reason>`) and `sandbox_read_paths`. No backend at all logs
   a `Sandbox unavailable` warning (not for `off`), and a self-test that
   raises logs its traceback.
-- Every `ConfinedSandbox.run` call logs exactly one line: `Command
-  completed` (with `output_bytes`), `Command failed` (`error_type`, plus
-  `reason` only for `ContainmentError`, since other messages can quote the
-  requested path), or `Command cancelled`. Self-test commands carry the
-  context field `sandbox_self_test=True`. Never log argv beyond the
-  program's name, or output.
+- Every `ConfinedSandbox.run` call logs `Command started` with its effective
+  timeout, then one terminal event: `Command completed`, `Command timed out`,
+  `Command failed`, or `Command cancelled`. Timeouts, failures, and cancellation
+  are warnings; normal completion includes exit code and output size.
+  A unique `command_id` context field links all runner and cleanup logs, and
+  `tool_call_id` links agent tool logs to approvals. Self-test commands carry
+  `sandbox_self_test=True`. Never log argv beyond the program's name, or output.
+- Approval refusals log `Tool call refused` with a safe reason code
+  (`invalid_arguments`, `path_rejected`, `approval_rejected`, or
+  `approval_missing`), without argument values or rejection notes. A failed
+  Seatbelt sweep logs `Process cleanup incomplete` with counts; successful
+  cleanup of escaped processes is reported only when the sweep succeeds.
 - A backend only builds the command line that confines a command
   (`confine`). `ConfinedSandbox.run` and `runner.run_process` do the rest
   for every backend:
@@ -211,17 +247,23 @@ Command sandbox (`app/agent/sandbox/`, plan and findings in
   workspace's existing denied paths using `Workspace.is_denied`. It has
   unit tests only; it hasn't run on Linux yet.
 
-Run limits (`AgentLimits`, from `agent_max_steps` and `agent_run_timeout`):
+Run limits (`AgentLimits`, from `agent_max_steps`, `agent_run_timeout`, and
+`agent_run_backstop_timeout`):
 
 - `agent_max_steps` is the run's `recursion_limit`. `react` reads
   `remaining_steps` and, when another tool round can't fit, replaces the
   tool-calling response with `STEP_LIMIT_MESSAGE`, so a run never ends in
   `GraphRecursionError` with unanswered tool calls.
-- `agent_run_timeout` wraps the whole run in `asyncio.timeout`; expiry raises
-  `AgentRunTimeoutError`, which `/invoke` returns as `504`. A cancelled run
-  can leave a tool call without a result in the checkpoint, so `react`
-  sends the model a placeholder `ToolMessage` for each one
-  (`_close_dangling_tool_calls`) without changing the saved history.
+- `agent_run_timeout` is a monotonic, process-local deadline checked before
+  model calls and after a model response that requests tools. When it
+  expires, `react` ends the graph between steps with `TIME_LIMIT_MESSAGE`,
+  preserving any completed tool result or final model answer.
+  Resuming an approved action refreshes this deadline. The larger
+  `agent_run_backstop_timeout` still wraps the whole run in `asyncio.timeout`;
+  it can cancel a tool mid-step, so `_close_dangling_tool_calls` sends an
+  ambiguous-result placeholder on the next turn. Do not persist the absolute
+  monotonic deadline across process restarts; a durable checkpointer needs a
+  different deadline representation.
 
 State and memory:
 
@@ -405,11 +447,13 @@ change its shape.
   explicitly in deployment before file-writing tools are enabled, or the
   service may be able to edit its own checkout. The `Startup complete` log
   shows the resolved root and the deny patterns in effect.
-- The run timeout cancels the run, which can't stop a synchronous tool in
-  its worker thread: the call can finish after the `504` with no result
-  saved. The next turn's placeholder therefore says the call may or may not
-  have run. Step 6 must replace this with a deadline that stops between
-  steps, before any side-effecting tool lands (see `docs/next-steps.md`).
+- `agent_run_timeout` is a deadline checked before each model invocation and
+  after a response that requests tools, so the graph stops between steps
+  rather than cancelling an approved side-effecting tool mid-step. A final
+  answer returned after the deadline is retained. `agent_run_backstop_timeout` is a
+  larger last resort for a genuinely stuck run and can still cancel a tool
+  running in a worker thread. In that case its side effect may or may not
+  have happened, and the next turn receives the ambiguous-result placeholder.
 - `grep` uses Python's `re`, which has no timeout: a pathological pattern can
   keep a worker thread busy after the run deadline cancels the request.
   Tools run in threads, and threads can't be cancelled.
