@@ -96,7 +96,12 @@ class Workspace:
         """Whether ``denied_paths`` added anything beyond the required patterns."""
         return len(self._denied_patterns) > len(REQUIRED_DENIED_PATTERNS)
 
-    def _is_denied(self, path: Path) -> bool:
+    def is_denied(self, path: Path) -> bool:
+        """Whether an absolute path inside the root matches a deny pattern.
+
+        This checks names only and follows no symlinks; ``resolve`` checks
+        both before and after following them.
+        """
         relative = path.relative_to(self.root)
         folded_parts = tuple(_fold(part) for part in relative.parts)
 
@@ -132,7 +137,7 @@ class Workspace:
                 f"path is outside the workspace: {path}", reason="outside"
             )
 
-        if self._is_denied(lexical):
+        if self.is_denied(lexical):
             raise WorkspaceAccessError(
                 f"path is denied by workspace policy: {path}", reason="denied"
             )
@@ -143,7 +148,7 @@ class Workspace:
                 f"path is outside the workspace: {path}", reason="outside"
             )
 
-        if self._is_denied(resolved):
+        if self.is_denied(resolved):
             raise WorkspaceAccessError(
                 f"path is denied by workspace policy: {path}", reason="denied"
             )

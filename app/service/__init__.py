@@ -5,6 +5,7 @@ from langchain_core.language_models import BaseChatModel
 
 from app.agent import router as agent_router
 from app.agent.graph import build_agent_graph
+from app.agent.sandbox.startup import make_sandbox
 from app.agent.service import AgentLimits
 from app.agent.threads import ThreadStore
 from app.agent.tools import make_read_tools
@@ -42,6 +43,9 @@ def make_on_startup(
             denied_paths=settings.workspace_denied_paths,
         )
         tools = make_read_tools(active_workspace)
+        # Self-tested before use; step 6 offers command tools only if it works.
+        sandbox_setup = await make_sandbox(settings, active_workspace)
+        app.state.sandbox = sandbox_setup.sandbox
         app.state.thread_store = threads
         app.state.workspace = active_workspace
         app.state.dev_ui_enabled = settings.dev_ui_enabled
@@ -68,6 +72,8 @@ def make_on_startup(
                 "agent_max_steps": settings.agent_max_steps,
                 "agent_run_timeout": settings.agent_run_timeout,
                 "dev_ui_enabled": settings.dev_ui_enabled,
+                "sandbox": sandbox_setup.status,
+                "sandbox_read_paths": [str(path) for path in sandbox_setup.read_paths],
             },
         )
 
@@ -81,6 +87,7 @@ async def on_shutdown(app: FastAPI) -> None:
     del app.state.workspace
     del app.state.agent_limits
     del app.state.dev_ui_enabled
+    del app.state.sandbox
     logger.info("Shutdown complete")
 
 

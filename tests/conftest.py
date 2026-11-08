@@ -10,6 +10,12 @@ from app.service import create_app
 from tests.fakes import EchoChatModel
 
 
+@pytest.fixture(autouse=True)
+def no_sandbox_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Skip the sandbox self-test at app startup unless a test asks for it."""
+    monkeypatch.setenv("SANDBOX_BACKEND", "off")
+
+
 @pytest.fixture
 def echo_model() -> EchoChatModel:
     """The fake chat model the app uses; its ``calls`` show what the model saw."""

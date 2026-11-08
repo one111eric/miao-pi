@@ -43,4 +43,5 @@ testpaths = ["tests"]
 markers = [
     "openai_live: makes a live, paid request to the configured OpenAI API",
     "local_llm_live: makes a live request to the configured local LLM server",
+    "sandbox: runs commands in the platform's real sandbox (Seatbelt or bubblewrap)",
 ]
