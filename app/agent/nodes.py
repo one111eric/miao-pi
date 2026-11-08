@@ -29,6 +29,11 @@ STEP_LIMIT_MESSAGE = (
     "Ask me to continue and I'll pick up from here."
 )
 
+TIME_LIMIT_MESSAGE = (
+    "I stopped because this request reached its time limit before I finished. "
+    "Ask me to continue and I'll pick up from here."
+)
+
 # A timed-out run can't stop a tool already running in a worker thread, so
 # the call may have finished after all; saying "not run" could get it repeated.
 INTERRUPTED_TOOL_RESULT = (
@@ -109,7 +114,7 @@ def _blocked_paths_note(workspace: Workspace | None) -> str:
         return ""
     note = (
         f" Paths matching {', '.join(REQUIRED_DENIED_PATTERNS)}, at any depth, "
-        "are blocked and can't be read or listed."
+        "are blocked and can't be accessed."
     )
     if workspace.has_configured_patterns:
         note += " Other paths may be blocked too."
@@ -124,7 +129,7 @@ def _system_prompt(
     parts = [SYSTEM_PROMPT]
     if tool_names:
         parts.append(
-            f"Inspect the project with these tools: {', '.join(tool_names)}. "
+            f"Work with the project using these tools: {', '.join(tool_names)}. "
             f"Paths are relative to the project root.{blocked_paths_note}"
         )
     if context:
@@ -196,6 +201,10 @@ def make_react(
 
     async def react(state: AgentState) -> AgentUpdate:
         started_at = perf_counter()
+        deadline = state.get("deadline")
+        if deadline is not None and asyncio.get_running_loop().time() >= deadline:
+            logger.warning("Agent time limit reached")
+            return {"messages": [AIMessage(content=TIME_LIMIT_MESSAGE)]}
         # Added per call rather than stored, so threads never save the prompt.
         system_prompt = _system_prompt(
             state.get("context"), tool_names, blocked_paths_note
@@ -230,7 +239,14 @@ def make_react(
 
         # Ending here keeps the history valid: a GraphRecursionError would leave
         # the requested tool calls unanswered.
-        if response.tool_calls and state["remaining_steps"] <= _STEPS_FOR_TOOL_ROUND:
+        if (
+            response.tool_calls
+            and deadline is not None
+            and asyncio.get_running_loop().time() >= deadline
+        ):
+            logger.warning("Agent time limit reached")
+            response = AIMessage(content=TIME_LIMIT_MESSAGE)
+        elif response.tool_calls and state["remaining_steps"] <= _STEPS_FOR_TOOL_ROUND:
             logger.warning(
                 "Agent step limit reached",
                 extra={"requested_tool_calls": len(response.tool_calls)},

@@ -507,6 +507,11 @@ approve. Before these tools land:
 - A run that passes its deadline while an approved tool runs still saves the
   tool's result, and the next turn shows it.
 
+**Partial status (2026-11-06):** `write_file` and `apply_patch` are
+implemented, use `Workspace`, require approval, and validate denied paths
+before approval. `run_command` remains. The run deadline now stops the graph
+between steps, with a larger cancellation backstop.
+
 **Done when:** the scripted run passes, and neither tool can act without
 approval.
 

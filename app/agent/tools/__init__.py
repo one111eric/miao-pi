@@ -13,6 +13,7 @@ from app.agent.tools.find import make_find_tool
 from app.agent.tools.grep import make_grep_tool
 from app.agent.tools.ls import make_ls_tool
 from app.agent.tools.read import make_read_tool
+from app.agent.tools.write import make_write_tools
 from app.agent.workspace import Workspace
 
 
@@ -24,3 +25,8 @@ def make_read_tools(workspace: Workspace) -> list[BaseTool]:
         make_find_tool(workspace),
         make_grep_tool(workspace),
     ]
+
+
+def make_agent_tools(workspace: Workspace) -> list[BaseTool]:
+    """Create every currently implemented agent tool for one workspace."""
+    return [*make_read_tools(workspace), *make_write_tools(workspace)]

@@ -46,6 +46,8 @@ class SvcSettings(BaseSettings):
     # LangGraph steps per request; each tool round takes two.
     agent_max_steps: int = Field(default=25, ge=5)
     agent_run_timeout: float = Field(default=300, gt=0)
+    # A larger last resort after the normal deadline stops between graph steps.
+    agent_run_backstop_timeout: float = Field(default=60, gt=0)
     # Serves the test page and the thread history endpoint. No auth until 7b.
     dev_ui_enabled: bool = False
     # The command sandbox (step 5b); see docs/sandbox.md.

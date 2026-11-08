@@ -8,7 +8,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import BaseTool
 
 from app.agent.graph import build_agent_graph
-from app.agent.tools import make_read_tools
+from app.agent.tools import make_agent_tools
 from app.agent.workspace import Workspace
 from app.service import create_app
 
@@ -21,7 +21,7 @@ async def serve(
 ) -> AsyncIterator[tuple[FastAPI, AsyncClient]]:
     """Run the app with its lifespan, a given model, and a workspace at ``root``.
 
-    ``extra_tools`` are added to the read tools, for tests that need a tool
+    ``extra_tools`` are added to the built-in tools, for tests that need a tool
     the app doesn't ship, such as one with a side effect.
     """
     workspace = Workspace(root)
@@ -32,7 +32,7 @@ async def serve(
                 model,
                 checkpointer=app.state.thread_store.checkpointer,
                 workspace=workspace,
-                tools=[*make_read_tools(workspace), *extra_tools],
+                tools=[*make_agent_tools(workspace), *extra_tools],
             )
         transport = ASGITransport(app=app)
         async with AsyncClient(

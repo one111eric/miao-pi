@@ -111,6 +111,15 @@ class GatedChatModel(BaseChatModel):
     def _llm_type(self) -> str:
         return "gated"
 
+    def bind_tools(
+        self,
+        tools: Sequence[BindableTool],
+        *,
+        tool_choice: str | None = None,
+        **kwargs: Any,
+    ) -> Runnable[LanguageModelInput, AIMessage]:
+        return self
+
     def _generate(
         self,
         messages: list[BaseMessage],

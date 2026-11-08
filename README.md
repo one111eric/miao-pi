@@ -92,23 +92,36 @@ Denied paths are rejected by `read` and never appear in `ls`, `find`, or
 `grep`. `find` and `grep` skip files matched by `.gitignore`, and binary
 files are never shown.
 
+It can also propose two write tools. Both pause for human approval before
+they run; a denied or outside-workspace path is rejected without requesting
+approval.
+
+| Tool | Does |
+| --- | --- |
+| `write_file` | Atomically replaces one UTF-8 text file; parent directories must exist; NUL text and leaf symlinks are rejected; input is capped at 1,000,000 characters. |
+| `apply_patch` | Applies a text-only unified diff after verifying its context still matches; renames, NUL-containing sources, and leaf symlinks are rejected; input is capped at 1,000,000 characters. Multi-file I/O failures roll back earlier changes. |
+
 The model can call tools repeatedly within one request, bounded by:
 
 ```env
 AGENT_MAX_STEPS=25
 AGENT_RUN_TIMEOUT=300
+AGENT_RUN_BACKSTOP_TIMEOUT=60
 ```
 
 `AGENT_MAX_STEPS` counts graph steps; each tool round takes two. When it runs
 out, the agent stops and says so, and asking it to continue resumes with a
-fresh budget. A run that exceeds `AGENT_RUN_TIMEOUT` seconds returns
-`504 Gateway Timeout`.
+fresh budget. `AGENT_RUN_TIMEOUT` is a per-request deadline checked between
+graph steps, so an approved write is allowed to finish and save its result; a
+final model answer that completes just after the deadline is preserved.
+`AGENT_RUN_BACKSTOP_TIMEOUT` is the additional last-resort cancellation window
+for a genuinely stuck run.
 
 ## Approvals
 
 Tools that change things pause the run until you approve or reject them.
-None of the four tools above do; the write and command tools planned next
-will. When the agent asks for one, `/invoke` returns:
+None of the four read tools above do; the write tools do. When the agent asks
+for one, `/invoke` returns:
 
 ```json
 {

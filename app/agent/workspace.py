@@ -1,9 +1,10 @@
 import errno
 import io
 import os
+import secrets
 import stat
 import unicodedata
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
@@ -38,12 +39,33 @@ class WorkspaceAccessError(WorkspaceError):
         self.reason = reason
 
 
+class WorkspaceTransactionError(WorkspaceError):
+    """An I/O failure while committing a transaction, tied to its file."""
+
+    def __init__(self, path: Path, error: OSError) -> None:
+        super().__init__(str(error))
+        self.path = path
+        self.error = error
+
+
 @dataclass(frozen=True)
 class WorkspaceText:
     """Text read from the workspace; ``truncated`` is true when it was capped."""
 
     text: str
     truncated: bool
+
+
+@dataclass
+class _StagedWrite:
+    path: Path
+    directory: int
+    name: str
+    content: str | None
+    temporary: str | None = None
+    backup: str | None = None
+    had_original: bool = False
+    written: bool = False
 
 
 class Workspace:
@@ -155,6 +177,19 @@ class Workspace:
 
         return resolved
 
+    def resolve_write_target(self, path: str | Path) -> Path:
+        """Resolve a write target without allowing its leaf to be a symlink."""
+        resolved = self.resolve(path)
+        candidate = Path(path)
+        lexical = Path(
+            os.path.abspath(
+                candidate if candidate.is_absolute() else self.root / candidate
+            )
+        )
+        if lexical.is_symlink():
+            raise WorkspaceError("cannot write a symbolic link")
+        return resolved
+
     @contextmanager
     def open_file(self, path: str | Path) -> Iterator[io.BufferedReader]:
         """Open a regular file inside the workspace for binary reading.
@@ -218,6 +253,252 @@ class Workspace:
             raise
         finally:
             os.close(directory)
+
+    def _open_parent_beneath_root(self, relative: Path) -> tuple[int, str]:
+        """Open a writable target's parent without following swapped links.
+
+        The caller owns the returned directory descriptor.  This mirrors the
+        read path's component-by-component walk, so an approved write cannot
+        be redirected outside the workspace between validation and rename.
+        """
+        if not relative.parts:
+            raise IsADirectoryError(
+                errno.EISDIR, os.strerror(errno.EISDIR), str(relative)
+            )
+        *parents, name = relative.parts
+        directory = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            root_stat = os.fstat(directory)
+            if (root_stat.st_dev, root_stat.st_ino) != self._root_id:
+                raise WorkspaceError("workspace root changed")
+            for part in parents:
+                child = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=directory,
+                )
+                os.close(directory)
+                directory = child
+        except OSError as error:
+            os.close(directory)
+            if error.errno in (errno.ELOOP, errno.ENOTDIR):
+                raise WorkspaceError("path changed while opening") from error
+            raise
+        return directory, name
+
+    def write_text_atomic(self, path: str | Path, content: str) -> Path:
+        """Atomically replace a workspace text file after enforcing its boundary.
+
+        Parent directories must already exist.  The temporary file and rename
+        use a checked directory descriptor so a concurrent symlink swap can't
+        send a write outside the workspace.
+        """
+        resolved = self.resolve_write_target(path)
+        if resolved == self.root:
+            raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), str(path))
+        directory, name = self._open_parent_beneath_root(
+            resolved.relative_to(self.root)
+        )
+        temporary: str | None = None
+        try:
+            try:
+                destination = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                mode = 0o666
+            else:
+                if not stat.S_ISREG(destination.st_mode):
+                    raise IsADirectoryError(
+                        errno.EISDIR, os.strerror(errno.EISDIR), str(path)
+                    )
+                mode = stat.S_IMODE(destination.st_mode)
+
+            for _ in range(10):
+                temporary = f".miao-pi-{secrets.token_hex(12)}.tmp"
+                try:
+                    descriptor = os.open(
+                        temporary,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        mode,
+                        dir_fd=directory,
+                    )
+                    break
+                except FileExistsError:
+                    temporary = None
+            else:
+                raise WorkspaceError("could not allocate a temporary file")
+
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as file:
+                    file.write(content)
+                    file.flush()
+                    os.fsync(file.fileno())
+                os.replace(temporary, name, src_dir_fd=directory, dst_dir_fd=directory)
+                temporary = None
+                os.fsync(directory)
+            finally:
+                if temporary is not None:
+                    try:
+                        os.unlink(temporary, dir_fd=directory)
+                    except FileNotFoundError:
+                        pass
+        finally:
+            os.close(directory)
+        return resolved
+
+    def remove_file(self, path: str | Path) -> Path:
+        """Remove a regular workspace file without following swapped links."""
+        resolved = self.resolve_write_target(path)
+        if resolved == self.root:
+            raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), str(path))
+        directory, name = self._open_parent_beneath_root(
+            resolved.relative_to(self.root)
+        )
+        try:
+            target = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            if not stat.S_ISREG(target.st_mode):
+                raise IsADirectoryError(
+                    errno.EISDIR, os.strerror(errno.EISDIR), str(path)
+                )
+            os.unlink(name, dir_fd=directory)
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        return resolved
+
+    def write_text_transaction(
+        self, changes: Sequence[tuple[str | Path, str | None]]
+    ) -> list[Path]:
+        """Apply file replacements and deletions, restoring all on a failure.
+
+        Each replacement is staged in its destination directory before any
+        visible path changes. Renames still happen one at a time, but every
+        already-modified destination is restored if a later rename fails. A
+        process killed between moving an original to its backup and moving in
+        its replacement can temporarily leave that destination absent; this
+        is not a durable, crash-safe transaction protocol.
+        """
+        if not changes:
+            return []
+
+        staged: list[_StagedWrite] = []
+        seen: set[Path] = set()
+        active_path: Path | None = None
+        try:
+            for path, content in changes:
+                resolved = self.resolve_write_target(path)
+                active_path = resolved
+                if resolved == self.root:
+                    raise IsADirectoryError(
+                        errno.EISDIR, os.strerror(errno.EISDIR), str(path)
+                    )
+                if resolved in seen:
+                    raise WorkspaceError("a transaction cannot change one file twice")
+                seen.add(resolved)
+                directory, name = self._open_parent_beneath_root(
+                    resolved.relative_to(self.root)
+                )
+                entry = _StagedWrite(resolved, directory, name, content)
+                staged.append(entry)
+                try:
+                    destination = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                except FileNotFoundError:
+                    if content is None:
+                        raise
+                    mode = 0o666
+                else:
+                    if not stat.S_ISREG(destination.st_mode):
+                        raise IsADirectoryError(
+                            errno.EISDIR, os.strerror(errno.EISDIR), str(path)
+                        )
+                    entry.had_original = True
+                    mode = stat.S_IMODE(destination.st_mode)
+
+                if content is not None:
+                    temporary = self._temporary_name(directory)
+                    entry.temporary = temporary
+                    descriptor = os.open(
+                        temporary,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        mode,
+                        dir_fd=directory,
+                    )
+                    with os.fdopen(
+                        descriptor, "w", encoding="utf-8", newline=""
+                    ) as file:
+                        file.write(content)
+                        file.flush()
+                        os.fsync(file.fileno())
+
+            for entry in staged:
+                directory = entry.directory
+                name = entry.name
+                active_path = entry.path
+                if entry.had_original:
+                    backup = self._temporary_name(directory)
+                    entry.backup = backup
+                    os.replace(name, backup, src_dir_fd=directory, dst_dir_fd=directory)
+                staged_temporary: str | None = entry.temporary
+                if staged_temporary is not None:
+                    os.replace(
+                        staged_temporary,
+                        name,
+                        src_dir_fd=directory,
+                        dst_dir_fd=directory,
+                    )
+                    entry.temporary = None
+                    entry.written = True
+                os.fsync(directory)
+        except BaseException as original_error:
+            rollback_error: OSError | None = None
+            for entry in reversed(staged):
+                directory = entry.directory
+                name = entry.name
+                try:
+                    if entry.written:
+                        try:
+                            os.unlink(name, dir_fd=directory)
+                        except FileNotFoundError:
+                            pass
+                    saved_backup: str | None = entry.backup
+                    if saved_backup is not None:
+                        os.replace(
+                            saved_backup,
+                            name,
+                            src_dir_fd=directory,
+                            dst_dir_fd=directory,
+                        )
+                        entry.backup = None
+                    os.fsync(directory)
+                except OSError as error:
+                    rollback_error = error
+            if rollback_error is not None:
+                raise WorkspaceError("transaction failed and rollback was incomplete")
+            if isinstance(original_error, OSError) and active_path is not None:
+                raise WorkspaceTransactionError(
+                    active_path, original_error
+                ) from original_error
+            raise
+        finally:
+            for entry in staged:
+                directory = entry.directory
+                for leftover in (entry.temporary, entry.backup):
+                    if leftover is not None:
+                        try:
+                            os.unlink(leftover, dir_fd=directory)
+                        except FileNotFoundError:
+                            pass
+                os.close(directory)
+        return [entry.path for entry in staged]
+
+    @staticmethod
+    def _temporary_name(directory: int) -> str:
+        for _ in range(10):
+            name = f".miao-pi-{secrets.token_hex(12)}.tmp"
+            try:
+                os.stat(name, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                return name
+        raise WorkspaceError("could not allocate a temporary file")
 
     def read_text(self, path: str | Path, *, max_chars: int) -> WorkspaceText:
         """Read at most ``max_chars`` and mark truncated content."""

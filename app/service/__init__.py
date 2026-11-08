@@ -8,7 +8,7 @@ from app.agent.graph import build_agent_graph
 from app.agent.sandbox.startup import make_sandbox
 from app.agent.service import AgentLimits
 from app.agent.threads import ThreadStore
-from app.agent.tools import make_read_tools
+from app.agent.tools import make_agent_tools
 from app.agent.workspace import Workspace
 from app.health.router import router as health_router
 from app.service.error_handling import register_exception_handlers
@@ -42,7 +42,7 @@ def make_on_startup(
             root=settings.workspace_root,
             denied_paths=settings.workspace_denied_paths,
         )
-        tools = make_read_tools(active_workspace)
+        tools = make_agent_tools(active_workspace)
         # Self-tested before use; step 6 offers command tools only if it works.
         sandbox_setup = await make_sandbox(settings, active_workspace)
         app.state.sandbox = sandbox_setup.sandbox
@@ -52,6 +52,7 @@ def make_on_startup(
         app.state.agent_limits = AgentLimits(
             max_steps=settings.agent_max_steps,
             run_timeout=settings.agent_run_timeout,
+            backstop_timeout=settings.agent_run_backstop_timeout,
         )
         # Built once here so a misconfigured provider fails at startup.
         app.state.agent_graph = build_agent_graph(
@@ -71,6 +72,7 @@ def make_on_startup(
                 "agent_tools": [tool.name for tool in tools],
                 "agent_max_steps": settings.agent_max_steps,
                 "agent_run_timeout": settings.agent_run_timeout,
+                "agent_run_backstop_timeout": settings.agent_run_backstop_timeout,
                 "dev_ui_enabled": settings.dev_ui_enabled,
                 "sandbox": sandbox_setup.status,
                 "sandbox_read_paths": [str(path) for path in sandbox_setup.read_paths],
