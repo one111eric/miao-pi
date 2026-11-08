@@ -92,14 +92,16 @@ Denied paths are rejected by `read` and never appear in `ls`, `find`, or
 `grep`. `find` and `grep` skip files matched by `.gitignore`, and binary
 files are never shown.
 
-It can also propose two write tools. Both pause for human approval before
-they run; a denied or outside-workspace path is rejected without requesting
-approval.
+It can also propose write and command tools. All pause for human approval
+before they run; a denied or outside-workspace path is rejected without
+requesting approval. `run_command` is offered only when the operating-system
+sandbox passes its startup self-test.
 
 | Tool | Does |
 | --- | --- |
 | `write_file` | Atomically replaces one UTF-8 text file; parent directories must exist; NUL text and leaf symlinks are rejected; input is capped at 1,000,000 characters. |
 | `apply_patch` | Applies a text-only unified diff after verifying its context still matches; renames, NUL-containing sources, and leaf symlinks are rejected; input is capped at 1,000,000 characters. Multi-file I/O failures roll back earlier changes. |
+| `run_command` | Runs an argv array from the workspace root in the OS sandbox. No shell is invoked automatically; an explicitly requested shell can interpret shell syntax. It has no network; output is capped and includes its exit or timeout status. |
 
 The model can call tools repeatedly within one request, bounded by:
 
@@ -150,8 +152,8 @@ page shows pending actions with Approve and Reject buttons.
 
 ## Command sandbox
 
-The commands the agent will run (from step 6 of the roadmap) execute in the
-operating system's own sandbox: Seatbelt on macOS, built in, or bubblewrap
+The commands the agent runs execute in the operating system's own sandbox:
+Seatbelt on macOS, built in, or bubblewrap
 on Linux (install the `bubblewrap` package). A sandboxed command:
 
 - has no network access, not even to `localhost`;

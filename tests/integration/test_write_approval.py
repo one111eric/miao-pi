@@ -8,9 +8,12 @@ from langchain_core.tools import StructuredTool
 
 from app.agent.approval import REQUIRES_APPROVAL
 from app.agent.nodes import INTERRUPTED_TOOL_RESULT
+from app.agent.sandbox import CommandResult
 from app.agent.service import AgentLimits
+from app.agent.tools.command import make_command_tool
+from app.agent.workspace import Workspace
 from tests.apps import serve
-from tests.fakes import ScriptedChatModel, tool_call
+from tests.fakes import FakeSandbox, ScriptedChatModel, tool_call
 
 
 def last_tool_result(messages: list[BaseMessage]) -> ToolMessage:
@@ -238,3 +241,117 @@ async def test_apply_patch_waits_for_approval_then_checks_its_base(
     assert pending.json()["actions"][0]["tool"] == "apply_patch"
     assert completed.json()["response"] == "Patched."
     assert (tmp_path / "notes.txt").read_text(encoding="utf-8") == "new\n"
+
+
+@pytest.mark.anyio
+async def test_run_command_waits_for_approval_then_uses_the_sandbox(
+    tmp_path: Path,
+) -> None:
+    sandbox = FakeSandbox(CommandResult(0, "1 passed\n", False, 9, False, 12.5))
+    command = make_command_tool(Workspace(tmp_path), sandbox)
+    model = ScriptedChatModel(
+        responses=[
+            tool_call("run_command", "command-1", argv=["pytest", "-q"]),
+            AIMessage(content="Tests pass."),
+        ]
+    )
+
+    async with serve(model, tmp_path, [command]) as (_, client):
+        pending = await client.post("/invoke", json={"message": "Run tests"})
+        completed = await client.post(
+            f"/threads/{pending.json()['thread_id']}/resume", json={"approved": True}
+        )
+
+    assert pending.json()["actions"] == [
+        {
+            "tool_call_id": "command-1",
+            "tool": "run_command",
+            "args": {"argv": ["pytest", "-q"]},
+        }
+    ]
+    assert completed.json()["response"] == "Tests pass."
+    assert sandbox.calls == [(["pytest", "-q"], tmp_path.resolve(), None)]
+    assert (
+        last_tool_result(model.calls[1]).content
+        == "Command exited with code 0.\n\n1 passed\n"
+    )
+
+
+@pytest.mark.anyio
+async def test_rejected_command_does_not_reach_the_sandbox(tmp_path: Path) -> None:
+    sandbox = FakeSandbox(CommandResult(0, "", False, 0, False, 0))
+    command = make_command_tool(Workspace(tmp_path), sandbox)
+    model = ScriptedChatModel(
+        responses=[
+            tool_call("run_command", "command-1", argv=["pytest", "-q"]),
+            AIMessage(content="I did not run it."),
+        ]
+    )
+
+    async with serve(model, tmp_path, [command]) as (_, client):
+        pending = await client.post("/invoke", json={"message": "Run tests"})
+        completed = await client.post(
+            f"/threads/{pending.json()['thread_id']}/resume", json={"approved": False}
+        )
+
+    assert completed.json()["response"] == "I did not run it."
+    assert sandbox.calls == []
+
+
+@pytest.mark.anyio
+async def test_invalid_command_is_rejected_without_asking_for_approval(
+    tmp_path: Path,
+) -> None:
+    sandbox = FakeSandbox(CommandResult(0, "", False, 0, False, 0))
+    command = make_command_tool(Workspace(tmp_path), sandbox)
+    model = ScriptedChatModel(
+        responses=[
+            tool_call("run_command", "command-1", argv=[]),
+            AIMessage(content="That command is invalid."),
+        ]
+    )
+
+    async with serve(model, tmp_path, [command]) as (_, client):
+        response = await client.post("/invoke", json={"message": "Run nothing"})
+
+    assert response.json()["status"] == "completed"
+    assert response.json()["response"] == "That command is invalid."
+    assert sandbox.calls == []
+    assert (
+        last_tool_result(model.calls[1]).content
+        == "Not run: Invalid command arguments: argv must be a non-empty array."
+    )
+
+
+@pytest.mark.anyio
+async def test_read_write_and_command_each_continue_through_approval(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "notes.txt").write_text("old\n", encoding="utf-8")
+    sandbox = FakeSandbox(CommandResult(0, "1 passed\n", False, 9, False, 12.5))
+    command = make_command_tool(Workspace(tmp_path), sandbox)
+    model = ScriptedChatModel(
+        responses=[
+            tool_call("read", "read-1", path="notes.txt"),
+            tool_call("write_file", "write-1", path="notes.txt", content="new\n"),
+            tool_call("run_command", "command-1", argv=["pytest", "-q"]),
+            AIMessage(content="Updated the note and the tests pass."),
+        ]
+    )
+
+    async with serve(model, tmp_path, [command]) as (_, client):
+        write_pending = await client.post("/invoke", json={"message": "Fix it"})
+        command_pending = await client.post(
+            f"/threads/{write_pending.json()['thread_id']}/resume",
+            json={"approved": True},
+        )
+        completed = await client.post(
+            f"/threads/{write_pending.json()['thread_id']}/resume",
+            json={"approved": True},
+        )
+
+    assert write_pending.json()["actions"][0]["tool"] == "write_file"
+    assert command_pending.json()["actions"][0]["tool"] == "run_command"
+    assert completed.json()["response"] == "Updated the note and the tests pass."
+    assert (tmp_path / "notes.txt").read_text(encoding="utf-8") == "new\n"
+    assert sandbox.calls == [(["pytest", "-q"], tmp_path.resolve(), None)]

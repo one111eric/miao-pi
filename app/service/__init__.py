@@ -42,9 +42,9 @@ def make_on_startup(
             root=settings.workspace_root,
             denied_paths=settings.workspace_denied_paths,
         )
-        tools = make_agent_tools(active_workspace)
-        # Self-tested before use; step 6 offers command tools only if it works.
+        # Commands are offered only after the sandbox has self-tested.
         sandbox_setup = await make_sandbox(settings, active_workspace)
+        tools = make_agent_tools(active_workspace, sandbox_setup.sandbox)
         app.state.sandbox = sandbox_setup.sandbox
         app.state.thread_store = threads
         app.state.workspace = active_workspace

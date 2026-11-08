@@ -14,11 +14,20 @@ from langchain_core.tools import tool
 
 from app.agent.graph import build_agent_graph
 from app.agent.nodes import STEP_LIMIT_MESSAGE, TIME_LIMIT_MESSAGE
+from app.agent.sandbox import CommandResult
+from app.agent.sandbox.startup import SandboxSetup
 from app.agent.service import AgentLimits
 from app.agent.tools import make_read_tools
 from app.agent.workspace import Workspace
+from common.config import SvcSettings
 from tests.apps import serve
-from tests.fakes import EchoChatModel, GatedChatModel, ScriptedChatModel, tool_call
+from tests.fakes import (
+    EchoChatModel,
+    FakeSandbox,
+    GatedChatModel,
+    ScriptedChatModel,
+    tool_call,
+)
 
 
 def log_record(caplog: pytest.LogCaptureFixture, message: str) -> logging.LogRecord:
@@ -62,6 +71,25 @@ async def test_startup_binds_the_workspace_tools(
         "write_file",
         "apply_patch",
     ]
+
+
+@pytest.mark.anyio
+async def test_startup_binds_command_tool_when_sandbox_is_available(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = EchoChatModel()
+    sandbox = FakeSandbox(CommandResult(0, "", False, 0, False, 0))
+
+    async def sandbox_ready(
+        settings: SvcSettings, workspace: Workspace
+    ) -> SandboxSetup:
+        return SandboxSetup(sandbox, "fake")
+
+    monkeypatch.setattr("app.service.make_sandbox", sandbox_ready)
+
+    async with serve(model, tmp_path) as (app, _):
+        assert app.state.sandbox is sandbox
+        assert "run_command" in model.bound_tools
 
 
 @pytest.mark.anyio

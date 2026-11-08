@@ -131,9 +131,11 @@ Tools (`app/agent/tools/`):
   instead of running `fd`/`rg`, so the deny list and `.gitignore` (via
   `pathspec`) apply exactly. Denied and escaping entries are hidden, not
   reported.
-- `make_write_tools(workspace)` builds `write_file` and `apply_patch`;
-  `make_agent_tools(workspace)` combines them with the read tools. Both write
-  tools require approval. `write_file` atomically replaces one UTF-8 text
+- `make_write_tools(workspace)` builds `write_file` and `apply_patch`.
+  `make_command_tool(workspace, sandbox)` builds `run_command`, and
+  `make_agent_tools(workspace, sandbox)` combines it with the read and write
+  tools only when startup supplied a self-tested sandbox. All three require
+  approval. `write_file` atomically replaces one UTF-8 text
   file, rejects NUL bytes, caps input at 1,000,000 characters, and requires
   its parent directory to exist. Both write primitives reject a leaf symlink
   rather than replacing its target. `apply_patch` has the same cap, accepts a
@@ -145,6 +147,12 @@ Tools (`app/agent/tools/`):
   backup, then staged replacement into place). A normal I/O failure rolls
   back, but process death in that small window can leave a destination absent;
   this is not crash-safe transaction durability.
+- `run_command` receives a non-empty argv array and does not invoke a shell
+  automatically; an explicit shell can interpret shell syntax. It
+  runs from the workspace root, and reuses the sandbox's timeout and bounded
+  output. Its result states the exit code or timeout and whether output was
+  truncated. Invalid argv is rejected before approval; sandbox setup failure
+  or a disabled sandbox means this tool is not registered at all.
 - `Workspace.open_file` is the only way to read file contents. It walks
   from the root one component at a time, each opened relative to its parent
   (`dir_fd`) with `O_NOFOLLOW`, so a symlink swapped in anywhere along the
@@ -162,7 +170,7 @@ Tools (`app/agent/tools/`):
   line count, because counting would read the whole file.
 
 Command sandbox (`app/agent/sandbox/`, plan and findings in
-`docs/sandbox.md`). Step 6's future `run_command` will:
+`docs/sandbox.md`) powers step 6's approval-gated `run_command` tool:
 
 - At startup, `make_sandbox` picks Seatbelt on macOS or bubblewrap on Linux
   and self-tests it. A plain command runs in the real workspace; the rest

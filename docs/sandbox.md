@@ -455,8 +455,9 @@ Runs `bwrap <args…> -- <argv…>` with:
 
 ### How step 6 uses it
 
-- **Approval card:** `run_command(argv, cwd?)` requires approval (5a). The
-  card shows the exact argv, the working directory, and the timeout.
+- **Approval card:** `run_command(argv)` requires approval (5a). The card
+  shows the exact argv. Commands use the configured workspace root and
+  `sandbox_command_timeout`; neither is an argument displayed in the card.
 - **Results:** a `CommandResult` becomes the tool result: the exit code (or
   "killed after 120s"), the output tail, and a notice when it was cut. A
   `ContainmentError` becomes an error result saying commands are off until
