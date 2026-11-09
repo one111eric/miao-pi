@@ -34,6 +34,8 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["agent"])
 
 
+# Starlette's app.state is dynamic. Startup establishes these concrete types;
+# object | None keeps unchecked Any out of the router until the boundary cast.
 def get_agent_graph(request: Request) -> AgentGraph:
     graph: object | None = getattr(request.app.state, "agent_graph", None)
     if graph is None:
@@ -74,7 +76,11 @@ ThreadIdPath = Annotated[str, Path(pattern=THREAD_ID_PATTERN)]
 
 @contextmanager
 def run_errors_as_http() -> Iterator[None]:
-    """Map the failures /invoke and resume share to HTTP errors."""
+    """Map shared run errors, including exceptions from awaits inside the block.
+
+    Streaming dependencies use this during preparation; execution errors after
+    headers are sent are handled by the stream producer as SSE error events.
+    """
     try:
         yield
     except ThreadBusyError as error:

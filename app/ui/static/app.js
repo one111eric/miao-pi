@@ -194,18 +194,28 @@ function renderTranscript() {
 }
 
 async function errorText(response) {
-  let detail = null;
-  try {
-    detail = (await response.json()).detail;
-  } catch {
-    // Not JSON; fall back to the status below.
-  }
-  if (Array.isArray(detail)) detail = detail.map((item) => item.msg).join("; ");
   const known = {
     500: "The server hit an unexpected error. Look up the request id in the logs.",
     502: "The LLM provider request failed.",
   };
-  return known[response.status] ?? detail ?? `Request failed with HTTP ${response.status}.`;
+  if (known[response.status]) return known[response.status];
+  const fallback = `Request failed with HTTP ${response.status}.`;
+  const contentType = (response.headers.get("Content-Type") ?? "")
+    .split(";", 1)[0].trim().toLowerCase();
+  if (contentType !== "application/json" && !contentType.endsWith("+json")) return fallback;
+  try {
+    const detail = (await response.json())?.detail;
+    if (typeof detail === "string" && detail.trim()) return detail;
+    if (Array.isArray(detail)) {
+      const messages = detail
+        .map((item) => item?.msg)
+        .filter((message) => typeof message === "string" && message.trim());
+      if (messages.length) return messages.join("; ");
+    }
+  } catch {
+    // A malformed JSON error response still has a usable HTTP status.
+  }
+  return fallback;
 }
 
 async function refreshHistory({ isNew = false } = {}) {

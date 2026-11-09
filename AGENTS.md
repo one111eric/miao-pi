@@ -11,8 +11,10 @@ LangGraph workflow that calls an OpenAI-compatible chat model.
 Python 3.13.7, managed with `uv`. Always run tools through `uv run`.
 
 ```bash
-uv sync                                                    # install deps
-uv run uvicorn app.service.server:app --reload --port 9091 # dev server
+# Install dependencies
+uv sync
+# Start the development server
+uv run uvicorn app.service.server:app --reload --port 9091
 ```
 
 All four checks must pass before committing (CI runs the same):
@@ -59,7 +61,7 @@ compiled graph `preplanning → react ⇄ [approve →] tools → finalize`.
 `POST /threads/{thread_id}/resume` → `resume_agent()` continues a run paused
 in `approve`.
 
-Streaming (step 7a, payloads in `docs/streaming.md`):
+Streaming (step 7a, payloads in [docs/streaming.md](docs/streaming.md)):
 
 - `POST /stream` and `POST /threads/{thread_id}/resume/stream` use FastAPI's
   `EventSourceResponse` and emit JSON SSE events. `prepare_invoke` and

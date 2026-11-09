@@ -85,3 +85,31 @@ test("UI reports an incomplete stream rather than treating it as completed", asy
   const result = await vm.runInContext('post("/stream", {}, "Running")', context);
   assert.match(result.error, /ended before the run finished/);
 });
+
+test("HTTP errors preserve useful JSON detail and fall back safely", async () => {
+  const context = appContext([]);
+  for (const [body, expected] of [
+    [{ detail: "Thread already has a run in progress" }, "Thread already has a run in progress"],
+    [{ detail: [{ msg: "Field required" }, null, { msg: {} }] }, "Field required"],
+    [{ detail: {} }, "Request failed with HTTP 409."],
+    [{ detail: "" }, "Request failed with HTTP 409."],
+    [null, "Request failed with HTTP 409."],
+  ]) {
+    const result = await context.errorText(new Response(JSON.stringify(body), {
+      status: 409, headers: { "Content-Type": "application/json" },
+    }));
+    assert.equal(result, expected);
+  }
+  assert.equal(await context.errorText(new Response("broken JSON", {
+    status: 503, headers: { "Content-Type": "application/json" },
+  })), "Request failed with HTTP 503.");
+
+  const html = new Response("<h1>Unavailable</h1>", {
+    status: 503, headers: { "Content-Type": "text/html" },
+  });
+  html.json = () => { throw new Error("Must not attempt JSON parsing for HTML"); };
+  assert.equal(await context.errorText(html), "Request failed with HTTP 503.");
+  assert.equal(await context.errorText(new Response('{"detail":"private details"}', {
+    status: 500, headers: { "Content-Type": "application/json" },
+  })), "The server hit an unexpected error. Look up the request id in the logs.");
+});
