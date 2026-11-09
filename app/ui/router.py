@@ -59,3 +59,12 @@ async def stylesheet() -> FileResponse:
         media_type="text/css",
         headers=_HEADERS,
     )
+
+
+@router.get("/sse.js")
+async def stream_parser() -> FileResponse:
+    return FileResponse(
+        STATIC_DIR / "sse.js",
+        media_type="text/javascript",
+        headers=_HEADERS,
+    )

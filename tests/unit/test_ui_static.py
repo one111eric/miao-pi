@@ -16,7 +16,7 @@ FORBIDDEN = (
 )
 
 
-@pytest.mark.parametrize("name", ["index.html", "app.js", "app.css"])
+@pytest.mark.parametrize("name", ["index.html", "app.js", "sse.js", "app.css"])
 def test_the_page_never_turns_text_into_html_or_code(name: str) -> None:
     content = (STATIC_DIR / name).read_text(encoding="utf-8")
 

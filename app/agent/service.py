@@ -1,6 +1,7 @@
 import asyncio
 import logging
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
@@ -38,6 +39,15 @@ class AgentLimits:
     run_timeout: float
     # Only a last-resort cancellation after the normal deadline lets a step end.
     backstop_timeout: float = 60
+
+
+@dataclass(frozen=True)
+class AgentRun:
+    """One validated run whose thread is held until its caller finishes."""
+
+    thread_id: str
+    graph_input: AgentState | Command[Any]
+    config: RunnableConfig
 
 
 class AgentRunTimeoutError(Exception):
@@ -142,16 +152,14 @@ def _response(thread_id: str, result: dict[str, Any]) -> AgentResponse:
     )
 
 
-async def invoke_agent(
+@asynccontextmanager
+async def prepare_invoke(
     request: AgentRequest,
     graph: AgentGraph,
     threads: ThreadStore,
     limits: AgentLimits,
-) -> AgentResponse:
-    """Invoke the agent graph for one user message in a conversation thread.
-
-    The run either completes or pauses on tool calls that need approval.
-    """
+) -> AsyncIterator[AgentRun]:
+    """Validate and hold a conversation before starting its response."""
     thread_id = request.thread_id or str(uuid4())
     config = _config(thread_id, limits)
 
@@ -169,26 +177,25 @@ async def invoke_agent(
                 snapshot = await graph.aget_state(config)
                 if _pending_actions(snapshot.interrupts):
                     raise ThreadAwaitingApprovalError(thread_id)
-            result = await _run(
-                graph,
-                {
+            yield AgentRun(
+                thread_id=thread_id,
+                graph_input={
                     "messages": [HumanMessage(content=request.message)],
                     "deadline": _deadline(limits),
                 },
-                config,
-                limits,
+                config=config,
             )
-        return _response(thread_id, result)
 
 
-async def resume_agent(
+@asynccontextmanager
+async def prepare_resume(
     thread_id: str,
     request: ResumeRequest,
     graph: AgentGraph,
     threads: ThreadStore,
     limits: AgentLimits,
-) -> AgentResponse:
-    """Apply a human's decision to a paused run and continue it."""
+) -> AsyncIterator[AgentRun]:
+    """Validate a decision and hold its thread before starting the response."""
     config = _config(thread_id, limits)
 
     with logging_context(thread_id=thread_id):
@@ -214,13 +221,38 @@ async def resume_agent(
                 "approved": request.approved,
                 "note": request.note,
             }
-            result = await _run(
-                graph,
-                Command(resume=decision, update={"deadline": _deadline(limits)}),
-                config,
-                limits,
+            yield AgentRun(
+                thread_id=thread_id,
+                graph_input=Command(
+                    resume=decision, update={"deadline": _deadline(limits)}
+                ),
+                config=config,
             )
-        return _response(thread_id, result)
+
+
+async def invoke_agent(
+    request: AgentRequest,
+    graph: AgentGraph,
+    threads: ThreadStore,
+    limits: AgentLimits,
+) -> AgentResponse:
+    """Run a new turn, either completing or pausing for approval."""
+    async with prepare_invoke(request, graph, threads, limits) as run:
+        result = await _run(graph, run.graph_input, run.config, limits)
+        return _response(run.thread_id, result)
+
+
+async def resume_agent(
+    thread_id: str,
+    request: ResumeRequest,
+    graph: AgentGraph,
+    threads: ThreadStore,
+    limits: AgentLimits,
+) -> AgentResponse:
+    """Apply a human's decision to a paused run and continue it."""
+    async with prepare_resume(thread_id, request, graph, threads, limits) as run:
+        result = await _run(graph, run.graph_input, run.config, limits)
+        return _response(run.thread_id, result)
 
 
 def _thread_message(message: AnyMessage) -> ThreadMessage | None:

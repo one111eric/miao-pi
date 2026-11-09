@@ -30,7 +30,14 @@ def message(type: str, text: str, **fields: object) -> dict[str, object]:
 @pytest.mark.anyio
 @pytest.mark.parametrize(
     "path",
-    ["/ui", "/ui/", "/ui/app.js", "/ui/app.css", "/threads/thread-1/messages"],
+    [
+        "/ui",
+        "/ui/",
+        "/ui/app.js",
+        "/ui/sse.js",
+        "/ui/app.css",
+        "/threads/thread-1/messages",
+    ],
 )
 async def test_dev_routes_are_hidden_when_the_ui_is_off(
     app: FastAPI,
@@ -71,6 +78,7 @@ async def test_the_page_and_its_assets_are_served(
     redirect = await client.get("/ui")
     page = await client.get("/ui/")
     script = await client.get("/ui/app.js")
+    parser = await client.get("/ui/sse.js")
     stylesheet = await client.get("/ui/app.css")
 
     assert redirect.status_code == 307
@@ -81,6 +89,9 @@ async def test_the_page_and_its_assets_are_served(
     assert '<script src="app.js" defer></script>' in page.text
     assert script.status_code == 200
     assert script.headers["content-type"].startswith("text/javascript")
+    assert '<script src="sse.js" defer></script>' in page.text
+    assert parser.status_code == 200
+    assert parser.headers["content-type"].startswith("text/javascript")
     assert stylesheet.status_code == 200
     assert stylesheet.headers["content-type"].startswith("text/css")
 

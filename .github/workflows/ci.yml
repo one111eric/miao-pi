@@ -16,6 +16,9 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
       - name: Install Python and dependencies
         run: |
           uv python install 3.13.7
@@ -28,3 +31,5 @@ jobs:
         run: uv run mypy
       - name: Run tests
         run: uv run pytest
+      - name: Test browser stream handling
+        run: uv run node --test tests/js/streaming.test.cjs

@@ -59,6 +59,24 @@ compiled graph `preplanning → react ⇄ [approve →] tools → finalize`.
 `POST /threads/{thread_id}/resume` → `resume_agent()` continues a run paused
 in `approve`.
 
+Streaming (step 7a, payloads in `docs/streaming.md`):
+
+- `POST /stream` and `POST /threads/{thread_id}/resume/stream` use FastAPI's
+  `EventSourceResponse` and emit JSON SSE events. `prepare_invoke` and
+  `prepare_resume` share validation and thread holding with the JSON routes;
+  request-scoped dependencies preserve HTTP errors before headers are sent.
+- `streaming.py` maps `graph.astream(stream_mode=["messages", "updates"])`
+  to token, complete tool-call, and tool-result events. A checkpoint read
+  after exhaustion produces the terminal `done` or `awaiting_approval` event.
+  Mid-stream errors produce a safe `error` event without raw exception text.
+- `open_agent_stream` owns a producer task and a bounded queue. Request
+  teardown cancels and joins that task before releasing the thread, including
+  on disconnect. Keep the timeout and logging context inside the producer;
+  generators suspended at yield may be closed from another task.
+- Stream tokens are provisional. The final response can be a step/time-limit
+  message and must replace the displayed partial answer. There is no replay
+  or automatic retry of interrupted side effects.
+
 - `preplanning` reloads `AGENTS.md` (falling back to `README.md`) from the
   workspace on every turn, with a configured size cap.
 - `react` calls the LLM, which `build_agent_graph(llm, tools=...)` injects
@@ -359,6 +377,9 @@ Test UI (step 4b, plan in `docs/test-ui.md`):
   (`tests/unit/test_ui_static.py` checks). It's served with a strict CSP and
   no inline script or style, so keep JavaScript in `app.js` and CSS in
   `app.css`. All API calls go through `apiBase` in `app.js`.
+- The page uses POST streams for new turns and approval continuations. It
+  parses fragmented UTF-8 SSE with `sse.js`, renders text and tool activity
+  as it arrives, and fetches history on page reload or error recovery.
 - The page picks a new conversation's `thread_id` itself
   (`crypto.randomUUID()`), so a first turn that the server saved but answered
   with an error (`502`, `504`) still shows up. Error responses carry no
@@ -414,8 +435,9 @@ change its shape.
   `invoke_agent` reads saved state to check for a pending approval. `GatedChatModel` in `tests/fakes.py` holds every call until
   `release` is set, to test behavior while a run is in progress.
 - Tests that need the test UI set `app.state.dev_ui_enabled` explicitly, so a
-  developer's `.env` can't change the result. The page's JavaScript has no
-  automated tests; check it by hand (see `docs/test-ui.md`).
+  developer's `.env` can't change the result. SSE parsing and streamed UI
+  state have dependency-free Node tests: `uv run node --test tests/js/streaming.test.cjs`.
+  Check visual layout by hand (see `docs/test-ui.md`).
 - Tests that make live LLM calls need a pytest marker (`openai_live`,
   `local_llm_live`) and an env-var `skipif` gate, like
   `tests/integration/test_openai_llm.py`.

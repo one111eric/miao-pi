@@ -122,7 +122,7 @@ for a genuinely stuck run.
 ## Approvals
 
 Tools that change things pause the run until you approve or reject them.
-None of the four read tools above do; the write tools do. When the agent asks
+None of the four read tools above do; the write and command tools do. When the agent asks
 for one, `/invoke` returns:
 
 ```json
@@ -149,6 +149,28 @@ with the reply, or `awaiting_approval` again. While a thread waits, a new
 message to it returns `409`; a resume for a thread with nothing pending also
 returns `409`. A waiting thread still expires after `THREAD_TTL`. The test
 page shows pending actions with Approve and Reject buttons.
+
+## Streaming
+
+Use `POST /stream` with the same JSON body as `/invoke` to receive tokens and
+tool activity as server-sent events:
+
+```bash
+curl -N http://127.0.0.1:9091/stream \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"Read the README and summarize it."}'
+```
+
+Events are `token`, `tool_call`, `tool_result`, and one terminal event:
+`done`, `awaiting_approval`, or `error`. Every payload includes `thread_id`;
+it is also returned in the `X-Thread-ID` header. The `done` event contains
+the saved final response, which replaces any provisional streamed text.
+
+Continue an approval using `POST /threads/{thread_id}/resume/stream` with
+the same decision body as `/threads/{thread_id}/resume`. The existing JSON
+endpoints remain available. Disconnecting cancels the active run; reload
+saved history before retrying an action whose result was interrupted.
+Event payloads and error behavior are described in [docs/streaming.md](docs/streaming.md).
 
 ## Command sandbox
 
@@ -194,9 +216,10 @@ Design, decisions, and known limits are in `docs/sandbox.md`.
 
 ## Test UI
 
-A developer page for trying the agent in a browser. It shows each reply, the
-tool calls behind it with their results, and each turn's status, request id,
-and duration. It's off by default; turn it on in `.env`:
+A developer page for trying the agent in a browser. It streams reply text,
+tool calls and results as they arrive, and shows each turn's status, request
+id, and duration. Saved history is loaded when reopening the page and after
+a stream error. It's off by default; turn it on in `.env`:
 
 ```env
 DEV_UI_ENABLED=true

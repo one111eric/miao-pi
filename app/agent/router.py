@@ -1,9 +1,10 @@
 import logging
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from contextlib import contextmanager
 from typing import Annotated, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Request, Response, status
+from fastapi.sse import EventSourceResponse, ServerSentEvent
 
 from app.agent.graph import AgentGraph
 from app.agent.models import (
@@ -19,9 +20,12 @@ from app.agent.service import (
     NothingToApproveError,
     ThreadAwaitingApprovalError,
     invoke_agent,
+    prepare_invoke,
+    prepare_resume,
     read_thread_history,
     resume_agent,
 )
+from app.agent.streaming import STREAM_DESCRIPTION, AgentStream, open_agent_stream
 from app.agent.threads import ThreadBusyError, ThreadNotFoundError, ThreadStore
 from app.ui.gate import require_dev_ui
 
@@ -88,6 +92,78 @@ def run_errors_as_http() -> Iterator[None]:
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail="Agent run timed out",
         ) from error
+    except ThreadAwaitingApprovalError as error:
+        raise HTTPException(
+            status_code=409, detail="Thread is waiting for an approval; resume it first"
+        ) from error
+    except ThreadNotFoundError as error:
+        raise HTTPException(status_code=404, detail="Thread not found") from error
+    except NothingToApproveError as error:
+        raise HTTPException(
+            status_code=409, detail="Thread has nothing waiting for approval"
+        ) from error
+
+
+async def get_invoke_stream_run(
+    request: AgentRequest,
+    graph: AgentGraphDependency,
+    threads: ThreadStoreDependency,
+    limits: AgentLimitsDependency,
+    response: Response,
+) -> AsyncIterator[AgentStream]:
+    # Request-scoped dependencies hold the thread through response teardown.
+    with run_errors_as_http():
+        async with prepare_invoke(request, graph, threads, limits) as run:
+            async with open_agent_stream(run, graph, limits) as stream:
+                response.headers["Cache-Control"] = "no-store"
+                response.headers["X-Thread-ID"] = run.thread_id
+                yield stream
+
+
+async def get_resume_stream_run(
+    thread_id: ThreadIdPath,
+    request: ResumeRequest,
+    graph: AgentGraphDependency,
+    threads: ThreadStoreDependency,
+    limits: AgentLimitsDependency,
+    response: Response,
+) -> AsyncIterator[AgentStream]:
+    with run_errors_as_http():
+        async with prepare_resume(thread_id, request, graph, threads, limits) as run:
+            async with open_agent_stream(run, graph, limits) as stream:
+                response.headers["Cache-Control"] = "no-store"
+                response.headers["X-Thread-ID"] = run.thread_id
+                yield stream
+
+
+@router.post(
+    "/stream",
+    response_class=EventSourceResponse,
+    description=STREAM_DESCRIPTION,
+    responses={409: {"description": "Thread busy or awaiting approval"}},
+)
+async def stream_invoke(
+    run: Annotated[AgentStream, Depends(get_invoke_stream_run, scope="request")],
+) -> AsyncIterator[ServerSentEvent]:
+    async for event in run.events:
+        yield event
+
+
+@router.post(
+    "/threads/{thread_id}/resume/stream",
+    response_class=EventSourceResponse,
+    description="Approve or reject pending actions and stream the continuation. "
+    + STREAM_DESCRIPTION,
+    responses={
+        404: {"description": "No such thread"},
+        409: {"description": "Thread busy or nothing to approve"},
+    },
+)
+async def stream_resume(
+    run: Annotated[AgentStream, Depends(get_resume_stream_run, scope="request")],
+) -> AsyncIterator[ServerSentEvent]:
+    async for event in run.events:
+        yield event
 
 
 @router.post(
@@ -116,13 +192,7 @@ async def invoke(
     limits: AgentLimitsDependency,
 ) -> AgentResponse:
     with run_errors_as_http():
-        try:
-            return await invoke_agent(request, graph, threads, limits)
-        except ThreadAwaitingApprovalError as error:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Thread is waiting for an approval; resume it first",
-            ) from error
+        return await invoke_agent(request, graph, threads, limits)
 
 
 @router.post(
@@ -151,18 +221,7 @@ async def resume(
     limits: AgentLimitsDependency,
 ) -> AgentResponse:
     with run_errors_as_http():
-        try:
-            return await resume_agent(thread_id, request, graph, threads, limits)
-        except ThreadNotFoundError as error:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Thread not found",
-            ) from error
-        except NothingToApproveError as error:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Thread has nothing waiting for approval",
-            ) from error
+        return await resume_agent(thread_id, request, graph, threads, limits)
 
 
 @router.get(

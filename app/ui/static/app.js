@@ -94,6 +94,9 @@ function renderToolCall(call, result, waiting) {
   } else if (waiting) {
     state = "awaiting approval";
     output = "Waiting for your decision below.";
+  } else if (busy) {
+    state = "running";
+    output = "Waiting for the tool result.";
   }
   summary.append(
     element("span", "tool-name", call.name),
@@ -267,28 +270,68 @@ async function post(path, body, waitingText) {
     const seconds = ((performance.now() - started) / 1000).toFixed(1);
     statusLine.textContent = `${waitingText} ${seconds}s`;
   }, 100);
+  const info = { status: null, requestId: null, ms: 0, accepted: false };
+  const messages = new Map();
+  function assistant(id) {
+    if (!messages.has(id)) {
+      const message = { type: "ai", text: "", tool_calls: [] };
+      messages.set(id, message);
+      history.push(message);
+    }
+    return messages.get(id);
+  }
+
   try {
     const response = await fetch(`${apiBase}${path}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-    const info = {
-      status: response.status,
-      requestId: response.headers.get("X-Request-ID"),
-      ms: performance.now() - started,
-    };
-    if (response.ok) info.data = await response.json();
-    else info.error = await errorText(response);
+    info.status = response.status;
+    info.requestId = response.headers.get("X-Request-ID");
+    info.accepted = response.ok;
+    if (!response.ok) {
+      info.error = await errorText(response);
+      return info;
+    }
+    const returnedThread = response.headers.get("X-Thread-ID");
+    if (returnedThread) saveThreadId(returnedThread);
+    await readSSE(response, (event, data) => {
+      if (data.thread_id) saveThreadId(data.thread_id);
+      if (event === "token") {
+        assistant(data.message_id).text += data.text;
+      } else if (event === "tool_call") {
+        const message = assistant(data.message_id);
+        message.text = data.text;
+        message.tool_calls.push({ id: data.id, name: data.name, args: data.args });
+      } else if (event === "tool_result") {
+        history.push({ type: "tool", ...data });
+      } else if (event === "awaiting_approval") {
+        pendingActions = data.actions;
+        info.data = data;
+      } else if (event === "done") {
+        pendingActions = [];
+        // The final saved answer replaces provisional text, including a
+        // response replaced by the graph's time or step limit.
+        const provisional = [...messages.values()].filter((message) => !message.tool_calls.length);
+        const finalMessage = provisional[0] ?? assistant("final");
+        history = history.filter((message) => !provisional.slice(1).includes(message));
+        finalMessage.text = data.response ?? "";
+        info.data = data;
+      } else if (event === "error") {
+        info.error = data.detail;
+      }
+      renderTranscript();
+    });
+    if (!info.data && !info.error) {
+      info.error = "The stream ended before the run finished. Reload the conversation before retrying.";
+    }
     return info;
   } catch {
-    return {
-      status: null,
-      requestId: null,
-      ms: performance.now() - started,
-      error: "Couldn't reach the server.",
-    };
+    info.error = "The connection was interrupted. Reload the conversation before retrying.";
+    return info;
   } finally {
+    info.ms = performance.now() - started;
     clearInterval(timer);
   }
 }
@@ -300,16 +343,16 @@ async function send(text) {
   const isNew = !threadId;
   if (isNew) saveThreadId(newThreadId());
 
-  const pending = element("section", "turn pending");
-  pending.append(element("div", "message human", text));
-  transcript.append(pending);
-  pending.scrollIntoView({ block: "end" });
+  const pending = { type: "human", text, tool_calls: [] };
+  history.push(pending);
+  renderTranscript();
 
   const body = threadId ? { message: text, thread_id: threadId } : { message: text };
-  const info = await post("/invoke", body, "Waiting for the agent...");
+  const info = await post("/stream", body, "Waiting for the agent...");
   if (info.data) saveThreadId(info.data.thread_id);
 
-  await refreshHistory({ isNew });
+  if (!info.accepted) history = history.filter((message) => message !== pending);
+  if (info.error && info.accepted) await refreshHistory({ isNew });
   const saved = humanCount() > before;
   if (saved) addTurnInfo(humanCount() - 1, info);
   if (info.error) {
@@ -330,13 +373,13 @@ async function decide(approved, note) {
   renderTranscript();
 
   const info = await post(
-    `/threads/${encodeURIComponent(threadId)}/resume`,
+    `/threads/${encodeURIComponent(threadId)}/resume/stream`,
     { approved, note: note || null },
     approved ? "Approved; continuing..." : "Rejected; continuing...",
   );
   info.label = approved ? "Approved" : "Rejected";
 
-  await refreshHistory();
+  if (info.error) await refreshHistory();
   addTurnInfo(humanCount() - 1, info);
   if (info.error) notice = { text: info.error, info: null };
   renderTranscript();

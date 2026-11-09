@@ -45,7 +45,7 @@ langchain-openai 1.7.2, and fastapi 0.149.0.
 5a. Approval (interrupt + resume API)
 5b. Command sandbox
 6.  Write and command tools
-7.  Streaming
+7a. Streaming
 7b. Authentication + thread ownership
 8.  Persistent checkpointer and deployment
 ```
@@ -522,7 +522,12 @@ approval.
 
 ---
 
-## 7. Streaming
+## 7a. Streaming
+
+**Status: done (2026-11-08).** New turns and approval continuations support
+SSE; the developer UI displays tokens and tool activity live. Thread holding,
+deadlines, safe error events, and disconnect cleanup are covered by tests.
+The event contract is in [streaming.md](streaming.md).
 
 **Goal:** clients see tokens, tool activity, and approval requests as they
 happen.
@@ -583,7 +588,7 @@ the user's computer gains little from it. The risk that leaves open is described
   by a different caller gets `404`, not `403`, so it doesn't reveal that the
   thread exists.
 - Add the caller id to the logging context.
-- Streaming (7) and the 5a resume endpoint get the same token check as
+- Streaming (7a) and the 5a resume endpoint get the same token check as
   `/invoke`.
 - Add a `Host` allowlist (`TrustedHostMiddleware`) at the same time: it
   blocks DNS rebinding, and a deployment needs it anyway.
